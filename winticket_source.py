@@ -19,14 +19,15 @@ WINTICKET_RACE_URL_RE = re.compile(
     r"(?P<day_index>[0-9]+)/(?P<race_no>[0-9]+)"
 )
 TICKET_TYPES = ("3連単", "3連複", "2車単", "2車複", "2枠単", "2枠複", "ワイド", "単勝", "複勝")
+RIDER_CLASS_PATTERN = r"(?:[A-Z]\d|SS)"
 RIDER_RE = re.compile(
     r"^(?P<name>.+?)\s+"
     r"(?P<prefecture>[^\s]+)\s+"
-    r"(?P<rider_class>[A-Z]\d)\s+"
+    rf"(?P<rider_class>{RIDER_CLASS_PATTERN})\s+"
     r"(?:(?P<age>[0-9]+)歳\s+)?"
     r"(?P<term>[0-9]+)期$"
 )
-CLASS_RE = re.compile(r"^(?P<rider_class>[A-Z]\d)\s+(?:(?P<age>[0-9]+)歳\s+)?(?P<term>[0-9]+)期$")
+CLASS_RE = re.compile(rf"^(?P<rider_class>{RIDER_CLASS_PATTERN})\s+(?:(?P<age>[0-9]+)歳\s+)?(?P<term>[0-9]+)期$")
 VENUE_SLUGS = {
     "函館": "hakodate",
     "青森": "aomori",

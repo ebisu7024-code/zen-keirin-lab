@@ -170,6 +170,41 @@ class WinticketSourceTest(unittest.TestCase):
         self.assertEqual(riders[5].line_name, "ライン2")
         self.assertEqual(riders[5].line_position, "先頭")
 
+    def test_parse_racecard_accepts_ss_class_rider(self):
+        fixture = """
+        枠 車
+        選手名
+        1
+        1
+        郡司浩平 神奈川 SS 34歳 99期
+        本命 120.50
+        4
+        3
+        2 両
+        60.0
+        75.0 3.92 自力。
+        2
+        7
+        嶋津拓弥 神奈川 S1 40歳 103期
+        112.96
+        0
+        0
+        0 追
+        37.0
+        44.4 3.92 郡司君。
+        並び予想
+        1
+        7
+        結果
+        """
+        line_summary, riders = parse_winticket_racecard_html(fixture)
+        self.assertEqual(line_summary, "1-7")
+        self.assertEqual([rider.car_no for rider in riders], [1, 7])
+        self.assertEqual(riders[0].rider_name, "郡司浩平")
+        self.assertEqual(riders[0].rider_class, "SS")
+        self.assertEqual(riders[0].line_name, "ライン1")
+        self.assertEqual(riders[0].line_position, "先頭")
+
     def test_parse_result_rows_and_payouts(self):
         line_summary, rows, payouts = parse_winticket_result_html(RESULT_FIXTURE)
         self.assertEqual(line_summary, "1-7-5 / 6-2 / 3-4")
