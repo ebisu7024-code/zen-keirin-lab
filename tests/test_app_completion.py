@@ -202,6 +202,45 @@ class AppCompletionTest(unittest.TestCase):
         candidates = app.winticket_sync_candidates(races, limit=10)
         self.assertEqual(candidates["id"].tolist(), [2, 1])
 
+    def test_winticket_candidates_skip_result_only_gap_without_bets(self):
+        races = pd.DataFrame(
+            [
+                {
+                    "id": 1,
+                    "race_date": "2026-08-02",
+                    "source_race_id": "2026-08-02_36_01",
+                    "rider_count": 7,
+                    "line_count": 3,
+                    "result_row_count": 0,
+                    "payout_count": 0,
+                    "bet_count": 0,
+                },
+                {
+                    "id": 2,
+                    "race_date": "2026-08-02",
+                    "source_race_id": "2026-08-02_36_02",
+                    "rider_count": 0,
+                    "line_count": 0,
+                    "result_row_count": 0,
+                    "payout_count": 0,
+                    "bet_count": 0,
+                },
+                {
+                    "id": 3,
+                    "race_date": "2026-08-02",
+                    "source_race_id": "2026-08-02_36_03",
+                    "rider_count": 7,
+                    "line_count": 3,
+                    "result_row_count": 0,
+                    "payout_count": 0,
+                    "bet_count": 1,
+                },
+            ]
+        )
+
+        candidates = app.winticket_sync_candidates(races, limit=10)
+        self.assertEqual(candidates["id"].tolist(), [3, 2])
+
     def test_sync_winticket_race_list_keeps_existing_race_data(self):
         racecard_url = "https://www.winticket.jp/keirin/wakayama/racecard/2026072455/3/1"
         race_id = app.upsert_race(

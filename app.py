@@ -1645,9 +1645,12 @@ def sync_winticket_details_for_race_ids(race_ids: list[int], limit: int | None =
     line_counts = candidates["line_count"].fillna(0).astype(int)
     result_row_counts = candidates["result_row_count"].fillna(0).astype(int)
     payout_counts = candidates["payout_count"].fillna(0).astype(int)
+    bet_counts = candidates["bet_count"].fillna(1).astype(int) if "bet_count" in candidates.columns else pd.Series(1, index=candidates.index)
+    needs_rider_or_line = (rider_counts == 0) | (line_counts == 0)
+    needs_result_for_bets = (bet_counts > 0) & ((result_row_counts == 0) | (payout_counts == 0))
     candidates = candidates[
         (source_ids != "")
-        & ((rider_counts == 0) | (line_counts == 0) | (result_row_counts == 0) | (payout_counts == 0))
+        & (needs_rider_or_line | needs_result_for_bets)
     ].copy()
     candidates = candidates.sort_values(["race_date", "race_no"], ascending=[False, True])
     if limit is not None:
@@ -1728,9 +1731,12 @@ def winticket_sync_candidates(races: pd.DataFrame, limit: int = 30) -> pd.DataFr
     line_counts = races["line_count"].fillna(0).astype(int)
     result_row_counts = races["result_row_count"].fillna(0).astype(int)
     payout_counts = races["payout_count"].fillna(0).astype(int)
+    bet_counts = races["bet_count"].fillna(1).astype(int) if "bet_count" in races.columns else pd.Series(1, index=races.index)
+    needs_rider_or_line = (rider_counts == 0) | (line_counts == 0)
+    needs_result_for_bets = (bet_counts > 0) & ((result_row_counts == 0) | (payout_counts == 0))
     candidates = races[
         (source_ids != "")
-        & ((rider_counts == 0) | (line_counts == 0) | (result_row_counts == 0) | (payout_counts == 0))
+        & (needs_rider_or_line | needs_result_for_bets)
     ].copy()
     return candidates.sort_values(["race_date", "id"], ascending=[False, False]).head(limit)
 
