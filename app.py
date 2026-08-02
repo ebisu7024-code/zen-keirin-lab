@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import html
+import importlib
+import math
 import sqlite3
 import re
 from datetime import date, datetime
@@ -24,8 +27,15 @@ from keirin_logic import (
     profit,
     recovery_rate,
 )
-from winticket_source import WinticketSourceError, extract_source_race_id, fetch_winticket_race
+import winticket_source as winticket_source_module
 from venue_features import get_venue_feature, venue_feature_rows, venue_feature_url
+
+winticket_source_module = importlib.reload(winticket_source_module)
+WinticketSourceError = winticket_source_module.WinticketSourceError
+extract_source_race_id = winticket_source_module.extract_source_race_id
+fetch_winticket_race = winticket_source_module.fetch_winticket_race
+fetch_winticket_race_by_urls = winticket_source_module.fetch_winticket_race_by_urls
+fetch_winticket_race_listings = winticket_source_module.fetch_winticket_race_listings
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -35,15 +45,46 @@ DB_PATH = DATA_DIR / "zen_keirin_lab.sqlite3"
 MARK_OPTIONS = ["", "◎", "○", "▲", "△", "☆", "消", "見送り"]
 INFO_TYPES = ["事実", "本人発言", "過去レース観察", "Hypothesis", "出所不明"]
 CONFIDENCE_LEVELS = ["高", "中", "低"]
-STATUS_OPTIONS = ["予想中", "購入済み", "結果入力済み", "振り返り済み", "見送り"]
+STATUS_OPTIONS = ["開催前", "予想中", "購入済み", "終了", "結果入力済み", "振り返り済み", "見送り"]
 STYLE_OPTIONS = ["逃げ", "捲り", "差し", "追込", "自在", "不明"]
 POSITION_OPTIONS = ["先頭", "番手", "3番手", "単騎", "別線", "不明"]
 AMOUNT_UNITS = ["円", "TIPメダル", "TIPマネー", "ポイント", "枚", "単位混在"]
 BET_AMOUNT_UNITS = [unit for unit in AMOUNT_UNITS if unit != "単位混在"]
+STRATEGY_TYPES = ["", "1〜3着候補", "軸1人流し", "軸2人流し", "他人のっかり", "適当", "見送り", "その他"]
+PREDICTION_SOURCES = ["", "自分予想", "他人のっかり", "AI提案", "適当", "記録のみ"]
 ORDERED_HEAD_TICKET_TYPES = {"単勝", "2車単", "3連単"}
 LINE_STATUS_OPTIONS = ["", "機能", "半機能", "崩れ", "単騎", "未評価"]
+DEVELOPMENT_SCENARIOS = {
+    "ライン順走": {
+        "metric": "line_exact_top2",
+        "title": "ライン順走",
+        "summary": "先頭が踏み切り、番手まで続く形",
+    },
+    "番手差し": {
+        "metric": "second_first",
+        "title": "番手差し",
+        "summary": "番手が最後に前を交わす形",
+    },
+    "別線まくり": {
+        "metric": "leader_first",
+        "title": "別線まくり",
+        "summary": "選択ラインの先頭が頭まで届く形",
+    },
+    "単騎差し込み": {
+        "metric": "single_top3",
+        "title": "単騎差し込み",
+        "summary": "単騎が3着内へ入り込む形",
+    },
+    "競り・分断": {
+        "metric": "line_collapse",
+        "title": "競り・分断",
+        "summary": "選択ラインが上位でまとまらない形",
+    },
+}
+BANK_LINE_COLORS = ["#38bdf8", "#22c55e", "#f59e0b", "#f43f5e", "#a78bfa", "#14b8a6", "#fb7185", "#84cc16"]
 TIP_MEDAL_DAILY_GRANT = 10000
 TIP_MEDAL_RESET_TEXT = "翌日3:00"
+TODAY_SYNC_VERSION = "racecard-index-v4"
 
 
 def now_text() -> str:
@@ -156,6 +197,8 @@ def init_db() -> None:
                 distance INTEGER DEFAULT 0,
                 weather TEXT DEFAULT '',
                 wind REAL DEFAULT 0,
+                start_time TEXT DEFAULT '',
+                close_time TEXT DEFAULT '',
                 amount_unit TEXT DEFAULT '円',
                 status TEXT DEFAULT '予想中',
                 race_title TEXT DEFAULT '',
@@ -165,6 +208,7 @@ def init_db() -> None:
                 source_racecard_url TEXT DEFAULT '',
                 source_result_url TEXT DEFAULT '',
                 source_synced_at TEXT DEFAULT '',
+                source_status TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -210,6 +254,8 @@ def init_db() -> None:
                 payout INTEGER DEFAULT 0,
                 hit INTEGER DEFAULT 0,
                 expected_role TEXT DEFAULT '',
+                strategy_type TEXT DEFAULT '',
+                prediction_source TEXT DEFAULT '',
                 note TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -274,15 +320,20 @@ def init_db() -> None:
             """
         )
         ensure_column(conn, "races", "amount_unit", "TEXT DEFAULT '円'")
+        ensure_column(conn, "races", "start_time", "TEXT DEFAULT ''")
+        ensure_column(conn, "races", "close_time", "TEXT DEFAULT ''")
         ensure_column(conn, "races", "source_race_id", "TEXT DEFAULT ''")
         ensure_column(conn, "races", "source_racecard_url", "TEXT DEFAULT ''")
         ensure_column(conn, "races", "source_result_url", "TEXT DEFAULT ''")
         ensure_column(conn, "races", "source_synced_at", "TEXT DEFAULT ''")
+        ensure_column(conn, "races", "source_status", "TEXT DEFAULT ''")
         ensure_column(conn, "riders", "rider_class", "TEXT DEFAULT ''")
         ensure_column(conn, "riders", "term", "TEXT DEFAULT ''")
         ensure_column(conn, "riders", "post_race_comment", "TEXT DEFAULT ''")
         ensure_column(conn, "riders", "comment_eval", "TEXT DEFAULT ''")
         ensure_column(conn, "bets", "amount_unit", "TEXT DEFAULT ''")
+        ensure_column(conn, "bets", "strategy_type", "TEXT DEFAULT ''")
+        ensure_column(conn, "bets", "prediction_source", "TEXT DEFAULT ''")
         migrate_race_result_rows_primary_key(conn)
         backfill_source_race_ids(conn)
         conn.execute(
@@ -309,13 +360,29 @@ def race_amount_unit(race: dict | pd.Series | None) -> str:
     return unit if unit in AMOUNT_UNITS else "円"
 
 
-def amount_text(value: int | float, unit: str) -> str:
+def compact_tip_medal_text(value: int | float) -> str:
     amount = int(value or 0)
+    sign = "-" if amount < 0 else ""
+    absolute = abs(amount)
+    if absolute >= 10000:
+        compact = f"{absolute / 10000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{compact}万枚"
+    return f"{amount:,}枚"
+
+
+def amount_text(value: int | float, unit: str, *, compact_tip: bool = False) -> str:
+    amount = int(value or 0)
+    if compact_tip and unit == "TIPメダル":
+        return compact_tip_medal_text(amount)
     if unit == "単位混在":
         return f"{amount:,}（単位混在）"
     if unit == "円":
         return f"{amount:,}円"
     return f"{amount:,} {unit}"
+
+
+def metric_amount_text(value: int | float, unit: str) -> str:
+    return amount_text(value, unit, compact_tip=True)
 
 
 def summary_unit(bets: pd.DataFrame) -> str:
@@ -325,26 +392,130 @@ def summary_unit(bets: pd.DataFrame) -> str:
     return units[0] if len(units) == 1 else "単位混在"
 
 
-def amount_summary_text(bets: pd.DataFrame, column: str) -> str:
+def amount_summary_text(bets: pd.DataFrame, column: str, *, compact_tip: bool = False) -> str:
     if bets.empty or column not in bets.columns:
         return amount_text(0, "円")
     if "amount_unit" not in bets.columns:
         return amount_text(int(bets[column].sum()), "円")
     grouped = bets.groupby("amount_unit")[column].sum().sort_index()
-    return " / ".join(amount_text(value, unit) for unit, value in grouped.items())
+    return " / ".join(amount_text(value, unit, compact_tip=compact_tip) for unit, value in grouped.items())
 
 
-def profit_summary_text(bets: pd.DataFrame) -> str:
+def profit_summary_text(bets: pd.DataFrame, *, compact_tip: bool = False) -> str:
     if bets.empty:
         return amount_text(0, "円")
     work = bets.copy()
     if "収支" not in work.columns:
         work["収支"] = work.apply(lambda row: profit(row["stake"], row["payout"]), axis=1)
-    return amount_summary_text(work, "収支")
+    return amount_summary_text(work, "収支", compact_tip=compact_tip)
+
+
+def bet_unit_sort_key(unit: str) -> tuple[int, str]:
+    priority = {"円": 0, "TIPメダル": 1, "TIPマネー": 2, "ポイント": 3, "枚": 4}
+    unit_text = str(unit or "円")
+    return priority.get(unit_text, 99), unit_text
+
+
+def build_bet_unit_summary(bets: pd.DataFrame) -> pd.DataFrame:
+    if bets.empty:
+        return pd.DataFrame()
+    work = bets.copy()
+    if "amount_unit" not in work.columns:
+        work["amount_unit"] = "円"
+    work["amount_unit"] = work["amount_unit"].fillna("円").replace("", "円")
+    if "収支" not in work.columns:
+        work["収支"] = work.apply(lambda row: profit(row["stake"], row["payout"]), axis=1)
+    summary = (
+        work.groupby("amount_unit", dropna=False)
+        .agg(買い目数=("hit", "count"), 的中=("hit", "sum"), 購入=("stake", "sum"), 払戻=("payout", "sum"), 差分=("収支", "sum"))
+        .reset_index()
+    )
+    summary["的中率"] = summary.apply(lambda row: hit_rate(int(row["的中"]), int(row["買い目数"])), axis=1)
+    summary["回収率"] = summary.apply(lambda row: recovery_rate(row["購入"], row["払戻"]), axis=1)
+    summary["sort_key"] = summary["amount_unit"].apply(bet_unit_sort_key)
+    return summary.sort_values("sort_key").drop(columns=["sort_key"]).reset_index(drop=True)
+
+
+def hit_rate_metric_text(hit_count: int, bet_count: int) -> str:
+    return f"{hit_rate(int(hit_count), int(bet_count))}%"
 
 
 def default_bet_unit(race_unit: str) -> str:
     return race_unit if race_unit in BET_AMOUNT_UNITS else "TIPメダル"
+
+
+def race_time_text(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def has_passed_race_close(race_date: str | None, close_time: str | None) -> bool:
+    race_date_text = str(race_date or "").strip()
+    close_text = race_time_text(close_time)
+    if not race_date_text or not close_text:
+        return False
+    try:
+        close_at = datetime.strptime(f"{race_date_text} {close_text}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return datetime.now() >= close_at
+
+
+def status_after_public_sync(current_status: str | None, race_date: str | None, close_time: str | None, has_result: bool) -> str:
+    current = str(current_status or "").strip()
+    if current in {"結果入力済み", "振り返り済み", "見送り"}:
+        return current
+    if has_result or has_passed_race_close(race_date, close_time):
+        return "終了"
+    if current in {"", "予想中", "開催前"}:
+        return "開催前"
+    return current
+
+
+def source_status_after_public_sync(current_source_status: str | None, incoming_source_status: str | None) -> str:
+    current = str(current_source_status or "").strip()
+    incoming = str(incoming_source_status or "").strip()
+    if current in {"TIPSTAR取込", "補完済み"}:
+        return current
+    return incoming or current
+
+
+def refresh_public_statuses(target_date: str | None = None) -> None:
+    params: tuple = ()
+    where = ""
+    if target_date:
+        where = "WHERE r.race_date = ?"
+        params = (target_date,)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                r.id,
+                r.race_date,
+                r.status,
+                r.close_time,
+                COALESCE(rr.result_row_count, 0) AS result_row_count
+            FROM races r
+            LEFT JOIN (
+                SELECT race_id, COUNT(*) AS result_row_count
+                FROM race_result_rows
+                GROUP BY race_id
+            ) rr ON rr.race_id = r.id
+            {where}
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            next_status = status_after_public_sync(
+                row["status"],
+                row["race_date"],
+                row["close_time"],
+                int(row["result_row_count"] or 0) > 0,
+            )
+            if next_status != row["status"]:
+                conn.execute(
+                    "UPDATE races SET status = ?, updated_at = ? WHERE id = ?",
+                    (next_status, now_text(), int(row["id"])),
+                )
 
 
 def is_tip_medal(unit: str) -> bool:
@@ -353,7 +524,9 @@ def is_tip_medal(unit: str) -> bool:
 
 def net_label(unit: str) -> str:
     if is_tip_medal(unit):
-        return "練習差分"
+        return "メダル差分"
+    if unit == "円":
+        return "円収支"
     if unit == "単位混在":
         return "差分"
     return "収支"
@@ -365,6 +538,60 @@ def training_hit_label(unit: str) -> str:
 
 def remaining_tip_medals(stake: int | float) -> int:
     return max(TIP_MEDAL_DAILY_GRANT - int(stake or 0), 0)
+
+
+def render_unit_summary_metrics(row: pd.Series) -> None:
+    unit = str(row["amount_unit"] or "円")
+    bet_count = int(row["買い目数"] or 0)
+    hit_count = int(row["的中"] or 0)
+    stake = int(row["購入"] or 0)
+    payout = int(row["払戻"] or 0)
+    net = int(row["差分"] or 0)
+    hit_delta = f"{hit_count}/{bet_count}"
+
+    if is_tip_medal(unit):
+        st.markdown("##### TIPメダル（練習）")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("的中率", hit_rate_metric_text(hit_count, bet_count), hit_delta)
+        col2.metric("利用", metric_amount_text(stake, unit))
+        col3.metric("的中払戻", metric_amount_text(payout, unit))
+        col4.metric("残り目安", metric_amount_text(remaining_tip_medals(stake), unit))
+        col5.metric(net_label(unit), metric_amount_text(net, unit))
+        st.caption(
+            f"TIPメダルは毎日{compact_tip_medal_text(TIP_MEDAL_DAILY_GRANT)}付与、{TIP_MEDAL_RESET_TEXT}に失効。"
+            "現金損益ではなく、的中率と買い目の絞り込みを見る練習用の差分です。"
+        )
+        return
+
+    if unit == "円":
+        st.markdown("##### 現金収支（円）")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("的中率", hit_rate_metric_text(hit_count, bet_count), hit_delta)
+        col2.metric("購入合計", metric_amount_text(stake, unit))
+        col3.metric("払戻合計", metric_amount_text(payout, unit))
+        col4.metric(net_label(unit), metric_amount_text(net, unit))
+        col5.metric("回収率", f"{recovery_rate(stake, payout)}%")
+        return
+
+    st.markdown(f"##### {unit}")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("的中率", hit_rate_metric_text(hit_count, bet_count), hit_delta)
+    col2.metric("購入合計", metric_amount_text(stake, unit))
+    col3.metric("払戻合計", metric_amount_text(payout, unit))
+    col4.metric(net_label(unit), metric_amount_text(net, unit))
+    col5.metric("回収率", f"{recovery_rate(stake, payout)}%")
+
+
+def render_bet_performance_summary(bets: pd.DataFrame) -> None:
+    if bets.empty:
+        st.info("買い目を登録すると、投票癖と的中精度の分析が始まります。")
+        return
+
+    summary = build_bet_unit_summary(bets)
+    if len(summary) > 1:
+        st.caption("円とTIPメダルは別単位なので、合算せず単位別に表示します。")
+    for _, row in summary.iterrows():
+        render_unit_summary_metrics(row)
 
 
 def chart_height(row_count: int, base: int = 300, row_px: int = 30, max_height: int = 560) -> int:
@@ -458,6 +685,7 @@ def fetch_races() -> pd.DataFrame:
             COALESCE(rv.review_done, 0) AS review_done,
             COALESCE(bc.bet_count, 0) AS bet_count,
             COALESCE(bc.hit_count, 0) AS hit_count,
+            COALESCE(bc.missing_bet_reason_count, 0) AS missing_bet_reason_count,
             COALESCE(bc.total_stake, 0) AS total_stake,
             COALESCE(bc.total_payout, 0) AS total_payout
         FROM races r
@@ -501,6 +729,7 @@ def fetch_races() -> pd.DataFrame:
                 race_id,
                 COUNT(*) AS bet_count,
                 SUM(hit) AS hit_count,
+                SUM(CASE WHEN COALESCE(note, '') = '' THEN 1 ELSE 0 END) AS missing_bet_reason_count,
                 SUM(stake) AS total_stake,
                 SUM(payout) AS total_payout
             FROM bets
@@ -616,6 +845,8 @@ def fetch_all_bets() -> pd.DataFrame:
             b.payout,
             b.hit,
             b.expected_role,
+            b.strategy_type,
+            b.prediction_source,
             b.note,
             b.created_at,
             b.updated_at,
@@ -744,7 +975,7 @@ def upsert_race(race_id: int | None, payload: dict) -> int:
         "line_summary",
         "race_memo",
     ]
-    values = [payload[field] for field in fields]
+    values = [payload.get(field, "") for field in fields]
     source_race_id = extract_source_race_id(payload.get("source_ref", "")) or extract_source_race_id(payload.get("race_memo", ""))
     line_summary = payload.get("line_summary", "").strip()
     with get_conn() as conn:
@@ -852,11 +1083,13 @@ def add_bet(race_id: int, payload: dict) -> None:
                 payout,
                 hit,
                 expected_role,
+                strategy_type,
+                prediction_source,
                 note,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 race_id,
@@ -867,6 +1100,8 @@ def add_bet(race_id: int, payload: dict) -> None:
                 payload["payout"],
                 hit,
                 payload["expected_role"],
+                payload.get("strategy_type", ""),
+                payload.get("prediction_source", ""),
                 payload["note"],
                 timestamp,
                 timestamp,
@@ -889,6 +1124,8 @@ def update_bet(bet_id: int, payload: dict) -> None:
                 payout = ?,
                 hit = ?,
                 expected_role = ?,
+                strategy_type = ?,
+                prediction_source = ?,
                 note = ?,
                 updated_at = ?
             WHERE id = ?
@@ -901,6 +1138,8 @@ def update_bet(bet_id: int, payload: dict) -> None:
                 payload["payout"],
                 hit,
                 payload["expected_role"],
+                payload.get("strategy_type", ""),
+                payload.get("prediction_source", ""),
                 payload["note"],
                 now_text(),
                 bet_id,
@@ -1136,13 +1375,29 @@ def apply_winticket_source(race_id: int, source) -> None:
     timestamp = now_text()
     result_numbers = tuple(row.car_no for row in source.result_rows[:3])
     with get_conn() as conn:
+        race = conn.execute("SELECT race_date, status, close_time, source_status FROM races WHERE id = ?", (race_id,)).fetchone()
+        synced_status = status_after_public_sync(
+            race["status"] if race else "",
+            race["race_date"] if race else "",
+            getattr(source, "close_time", "") or (race["close_time"] if race else ""),
+            bool(result_numbers),
+        )
+        synced_source_status = source_status_after_public_sync(race["source_status"] if race else "", "補完済み")
         conn.execute(
             """
             UPDATE races
             SET source_race_id = CASE WHEN COALESCE(source_race_id, '') = '' THEN ? ELSE source_race_id END,
                 source_racecard_url = ?,
-                source_result_url = ?,
+                source_result_url = CASE WHEN ? = 'TIPSTAR取込' AND COALESCE(source_result_url, '') <> '' THEN source_result_url ELSE ? END,
                 source_synced_at = ?,
+                source_status = ?,
+                status = ?,
+                grade = CASE WHEN COALESCE(grade, '') = '' THEN ? ELSE grade END,
+                distance = CASE WHEN COALESCE(distance, 0) = 0 THEN ? ELSE distance END,
+                weather = CASE WHEN COALESCE(weather, '') = '' THEN ? ELSE weather END,
+                wind = CASE WHEN COALESCE(wind, 0) = 0 THEN ? ELSE wind END,
+                start_time = CASE WHEN COALESCE(start_time, '') = '' THEN ? ELSE start_time END,
+                close_time = CASE WHEN COALESCE(close_time, '') = '' THEN ? ELSE close_time END,
                 line_summary = CASE WHEN COALESCE(line_summary, '') = '' THEN ? ELSE line_summary END,
                 updated_at = ?
             WHERE id = ?
@@ -1150,8 +1405,17 @@ def apply_winticket_source(race_id: int, source) -> None:
             (
                 source.source_race_id,
                 source.racecard_url,
+                synced_source_status,
                 source.result_url,
                 timestamp,
+                synced_source_status,
+                synced_status,
+                getattr(source, "grade", ""),
+                int(getattr(source, "distance", 0) or 0),
+                getattr(source, "weather", ""),
+                float(getattr(source, "wind", 0.0) or 0.0),
+                getattr(source, "start_time", ""),
+                getattr(source, "close_time", ""),
                 source.line_summary,
                 timestamp,
                 race_id,
@@ -1205,22 +1469,234 @@ def apply_winticket_source(race_id: int, source) -> None:
     recompute_hits_for_race(race_id)
 
 
-def sync_winticket_for_race(race_id: int):
+def sync_winticket_for_race(race_id: int, fetcher=None):
     race = fetch_race(race_id)
     if not race:
         raise WinticketSourceError("選択レースが見つかりません。")
     source_race_id = race.get("source_race_id") or extract_source_race_id(race.get("race_memo", ""))
     if not source_race_id:
         raise WinticketSourceError("raceId が未登録のため、WINTICKET補完URLを解決できません。")
-    source = fetch_winticket_race(
-        race_date=race["race_date"],
-        race_no=int(race["race_no"]),
-        source_race_id=source_race_id,
-        venue=race.get("venue", ""),
-        race_title=race.get("race_title", ""),
-    )
+    if race.get("source_racecard_url"):
+        source = fetch_winticket_race_by_urls(
+            source_race_id=source_race_id,
+            racecard_url=race["source_racecard_url"],
+            result_url=race.get("source_result_url", ""),
+            fetcher=fetcher or winticket_source_module.fetch_url,
+        )
+    else:
+        source = fetch_winticket_race(
+            race_date=race["race_date"],
+            race_no=int(race["race_no"]),
+            source_race_id=source_race_id,
+            venue=race.get("venue", ""),
+            race_title=race.get("race_title", ""),
+            fetcher=fetcher or winticket_source_module.fetch_url,
+        )
     apply_winticket_source(race_id, source)
     return source
+
+
+def upsert_winticket_race_listing(listing) -> tuple[int, bool]:
+    timestamp = now_text()
+    racecard_url = listing.racecard_url
+    result_url = racecard_url.replace("/racecard/", "/raceresult/") if racecard_url else ""
+    with get_conn() as conn:
+        existing = None
+        if listing.source_race_id:
+            existing = conn.execute(
+                "SELECT id, status, source_status FROM races WHERE source_race_id = ? ORDER BY id LIMIT 1",
+                (listing.source_race_id,),
+            ).fetchone()
+        if not existing:
+            existing = conn.execute(
+                """
+                SELECT id, status, source_status
+                FROM races
+                WHERE race_date = ? AND venue = ? AND race_no = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (listing.race_date, listing.venue, int(listing.race_no)),
+            ).fetchone()
+
+        if existing:
+            race_id = int(existing["id"])
+            listing_status = status_after_public_sync(existing["status"], listing.race_date, listing.close_time, False)
+            listing_source_status = source_status_after_public_sync(existing["source_status"], listing.source_status)
+            conn.execute(
+                """
+                UPDATE races
+                SET source_race_id = CASE WHEN COALESCE(source_race_id, '') = '' THEN ? ELSE source_race_id END,
+                    source_racecard_url = CASE WHEN ? <> '' THEN ? ELSE source_racecard_url END,
+                    source_result_url = CASE
+                        WHEN COALESCE(source_status, '') = 'TIPSTAR取込' AND COALESCE(source_result_url, '') <> '' THEN source_result_url
+                        WHEN ? <> '' THEN ?
+                        ELSE source_result_url
+                    END,
+                    source_synced_at = ?,
+                    source_status = ?,
+                    status = ?,
+                    race_title = CASE WHEN COALESCE(race_title, '') = '' THEN ? ELSE race_title END,
+                    grade = CASE WHEN COALESCE(grade, '') = '' THEN ? ELSE grade END,
+                    start_time = CASE WHEN COALESCE(start_time, '') = '' THEN ? ELSE start_time END,
+                    close_time = CASE WHEN COALESCE(close_time, '') = '' THEN ? ELSE close_time END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    listing.source_race_id,
+                    racecard_url,
+                    racecard_url,
+                    result_url,
+                    result_url,
+                    timestamp,
+                    listing_source_status,
+                    listing_status,
+                    listing.race_title,
+                    listing.grade,
+                    listing.start_time,
+                    listing.close_time,
+                    timestamp,
+                    race_id,
+                ),
+            )
+            return race_id, False
+
+        cursor = conn.execute(
+            """
+            INSERT INTO races (
+                race_date,
+                venue,
+                race_no,
+                grade,
+                distance,
+                weather,
+                wind,
+                start_time,
+                close_time,
+                amount_unit,
+                status,
+                race_title,
+                line_summary,
+                race_memo,
+                source_race_id,
+                source_racecard_url,
+                source_result_url,
+                source_synced_at,
+                source_status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, 0, '', 0, ?, ?, '円', '開催前', ?, '', '', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                listing.race_date,
+                listing.venue,
+                int(listing.race_no),
+                listing.grade,
+                listing.start_time,
+                listing.close_time,
+                listing.race_title,
+                listing.source_race_id,
+                racecard_url,
+                result_url,
+                timestamp,
+                listing.source_status,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return int(cursor.lastrowid), True
+
+
+def sync_winticket_details_for_race_ids(race_ids: list[int], limit: int | None = None, fetcher=None) -> dict:
+    if not race_ids:
+        return {"synced": [], "failed": [], "skipped": 0}
+    races = fetch_races()
+    if races.empty:
+        return {"synced": [], "failed": [], "skipped": 0}
+    candidates = races[races["id"].astype(int).isin([int(race_id) for race_id in race_ids])].copy()
+    if candidates.empty:
+        return {"synced": [], "failed": [], "skipped": len(race_ids)}
+
+    source_ids = candidates["source_race_id"].fillna("").astype(str)
+    rider_counts = candidates["rider_count"].fillna(0).astype(int)
+    line_counts = candidates["line_count"].fillna(0).astype(int)
+    result_row_counts = candidates["result_row_count"].fillna(0).astype(int)
+    payout_counts = candidates["payout_count"].fillna(0).astype(int)
+    candidates = candidates[
+        (source_ids != "")
+        & ((rider_counts == 0) | (line_counts == 0) | (result_row_counts == 0) | (payout_counts == 0))
+    ].copy()
+    candidates = candidates.sort_values(["race_date", "race_no"], ascending=[False, True])
+    if limit is not None:
+        candidates = candidates.head(int(limit))
+
+    result = {"synced": [], "failed": [], "skipped": max(len(race_ids) - len(candidates), 0)}
+    for _, row in candidates.iterrows():
+        race_id = int(row["id"])
+        label = f"{row['race_date']} {row['venue']} {int(row['race_no'])}R"
+        try:
+            source = sync_winticket_for_race(race_id, fetcher=fetcher)
+        except Exception as exc:
+            result["failed"].append({"レース": label, "理由": str(exc)})
+        else:
+            result["synced"].append(
+                {
+                    "レース": label,
+                    "選手": len(source.riders),
+                    "ライン": len(parse_line_summary(source.line_summary)),
+                    "結果": len(source.result_rows),
+                    "払戻": len(source.payouts),
+                }
+            )
+    return result
+
+
+def sync_winticket_race_list_for_date(
+    target_date: str | date | None = None,
+    fetcher=None,
+    hydrate: bool = False,
+    hydrate_limit: int | None = None,
+) -> dict:
+    target = target_date or date.today()
+    target_text = target.isoformat() if isinstance(target, date) else str(target)
+    listings = fetch_winticket_race_listings(target_text, fetcher=fetcher)
+    created = 0
+    updated = 0
+    race_ids: list[int] = []
+    for listing in listings:
+        race_id, is_created = upsert_winticket_race_listing(listing)
+        race_ids.append(race_id)
+        if is_created:
+            created += 1
+        else:
+            updated += 1
+    refresh_public_statuses(target_text)
+    result = {
+        "race_date": target_text,
+        "fetched": len(listings),
+        "created": created,
+        "updated": updated,
+        "race_ids": race_ids,
+    }
+    if hydrate:
+        result["details"] = sync_winticket_details_for_race_ids(race_ids, limit=hydrate_limit, fetcher=fetcher)
+    return result
+
+
+def sync_today_winticket_races_once() -> dict | None:
+    today_text = date.today().isoformat()
+    session_key = f"winticket_today_synced_{today_text}_{TODAY_SYNC_VERSION}"
+    if st.session_state.get(session_key):
+        return st.session_state.get("winticket_today_sync_result")
+    try:
+        result = sync_winticket_race_list_for_date(today_text)
+    except Exception as exc:
+        result = {"race_date": today_text, "error": str(exc), "fetched": 0, "created": 0, "updated": 0}
+    st.session_state[session_key] = True
+    st.session_state["winticket_today_sync_result"] = result
+    return result
 
 
 def winticket_sync_candidates(races: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
@@ -1229,7 +1705,12 @@ def winticket_sync_candidates(races: pd.DataFrame, limit: int = 30) -> pd.DataFr
     source_ids = races["source_race_id"].fillna("").astype(str)
     rider_counts = races["rider_count"].fillna(0).astype(int)
     line_counts = races["line_count"].fillna(0).astype(int)
-    candidates = races[(source_ids != "") & ((rider_counts == 0) | (line_counts == 0))].copy()
+    result_row_counts = races["result_row_count"].fillna(0).astype(int)
+    payout_counts = races["payout_count"].fillna(0).astype(int)
+    candidates = races[
+        (source_ids != "")
+        & ((rider_counts == 0) | (line_counts == 0) | (result_row_counts == 0) | (payout_counts == 0))
+    ].copy()
     return candidates.sort_values(["race_date", "id"], ascending=[False, False]).head(limit)
 
 
@@ -1374,6 +1855,97 @@ def apply_style() -> None:
             border-radius: 4px;
             color: #e5edf5;
         }
+        .virtual-bank {
+            position: relative;
+            min-height: 430px;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            background:
+                radial-gradient(ellipse at center, rgba(15, 23, 42, 0.88) 0%, rgba(15, 23, 42, 0.88) 43%, transparent 44%),
+                linear-gradient(135deg, #111827, #18212f 55%, #111827);
+            overflow: hidden;
+        }
+        .virtual-bank::before {
+            content: "";
+            position: absolute;
+            inset: 34px 56px;
+            border: 28px solid #475569;
+            border-radius: 50%;
+            box-shadow: 0 0 0 2px rgba(226, 232, 240, 0.14) inset, 0 0 0 2px rgba(226, 232, 240, 0.18);
+        }
+        .virtual-bank::after {
+            content: "FINISH";
+            position: absolute;
+            top: 42px;
+            right: 72px;
+            padding: 4px 8px;
+            border-left: 3px solid #f8fafc;
+            color: #f8fafc;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0;
+            background: rgba(15, 23, 42, 0.72);
+        }
+        .bank-center-label {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            color: #cbd5e1;
+            text-align: center;
+            font-weight: 700;
+            line-height: 1.6;
+        }
+        .rider-chip {
+            position: absolute;
+            width: 92px;
+            min-height: 58px;
+            transform: translate(-50%, -50%);
+            border-radius: 8px;
+            border: 2px solid var(--line-color);
+            background: rgba(15, 23, 42, 0.94);
+            color: #f8fafc;
+            padding: 7px 8px;
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.28);
+        }
+        .rider-chip.is-active {
+            box-shadow: 0 0 0 3px rgba(248, 250, 252, 0.22), 0 12px 24px rgba(0, 0, 0, 0.28);
+        }
+        .rider-chip.is-projected {
+            background: rgba(20, 83, 45, 0.94);
+        }
+        .rider-no {
+            display: inline-block;
+            min-width: 24px;
+            height: 24px;
+            line-height: 24px;
+            text-align: center;
+            border-radius: 50%;
+            background: var(--line-color);
+            color: #020617;
+            font-weight: 900;
+            margin-right: 5px;
+        }
+        .rider-name {
+            display: block;
+            margin-top: 4px;
+            font-size: 12px;
+            color: #cbd5e1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .rider-rank {
+            position: absolute;
+            top: -12px;
+            right: -10px;
+            border-radius: 999px;
+            padding: 2px 7px;
+            background: #f8fafc;
+            color: #020617;
+            font-size: 12px;
+            font-weight: 900;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1387,9 +1959,12 @@ def race_label(row: pd.Series | dict) -> str:
 
 def sidebar_select_race(races: pd.DataFrame) -> int | None:
     st.sidebar.title("zenKeirin Lab")
+    page_options = ["ダッシュボード", "競輪場特徴", "レース登録", "選手評価", "展開予想", "買い目・結果", "振り返り"]
+    current_page = st.session_state.get("page", "ダッシュボード")
     page = st.sidebar.radio(
         "画面",
-        ["ダッシュボード", "競輪場特徴", "レース登録", "選手評価", "買い目・結果", "振り返り"],
+        page_options,
+        index=page_options.index(current_page) if current_page in page_options else 0,
     )
     st.session_state["page"] = page
 
@@ -1402,9 +1977,17 @@ def sidebar_select_race(races: pd.DataFrame) -> int | None:
         return None
 
     labels = [race_label(row) for _, row in races.iterrows()]
-    selected_label = st.sidebar.selectbox("対象レース", labels)
+    selected_id_from_state = st.session_state.get("selected_race_id")
+    race_ids = [int(row["id"]) for _, row in races.iterrows()]
+    try:
+        selected_id_value = int(selected_id_from_state) if selected_id_from_state is not None else None
+    except (TypeError, ValueError):
+        selected_id_value = None
+    default_index = race_ids.index(selected_id_value) if selected_id_value in race_ids else 0
+    selected_label = st.sidebar.selectbox("対象レース", labels, index=default_index)
     selected_index = labels.index(selected_label)
     selected_id = int(races.iloc[selected_index]["id"])
+    st.session_state["selected_race_id"] = selected_id
 
     with st.sidebar.expander("初期データ"):
         st.caption("DBが空のときだけサンプルを投入できます。")
@@ -1450,11 +2033,71 @@ def research_issues(row: pd.Series) -> list[str]:
         issues.append("ライン未補完")
     if int(row.get("result_row_count", 0) or 0) == 0:
         issues.append("結果詳細なし")
+    if int(row.get("bet_count", 0) or 0) == 0:
+        issues.append("買い目未入力")
+    if int(row.get("missing_bet_reason_count", 0) or 0) > 0:
+        issues.append("買い目理由なし")
     if int(row.get("line_count", 0) or 0) > 0 and int(row.get("line_review_count", 0) or 0) == 0:
         issues.append("ライン未評価")
     if int(row.get("review_done", 0) or 0) == 0:
         issues.append("振り返り未完了")
     return issues
+
+
+def sort_latest_races(races: pd.DataFrame) -> pd.DataFrame:
+    if races.empty:
+        return races
+    work = races.copy()
+    if "source_synced_at" not in work.columns:
+        work["source_synced_at"] = ""
+    return work.sort_values(["race_date", "source_synced_at", "race_no"], ascending=[False, False, False])
+
+
+def queue_row(row: pd.Series, issue: str = "") -> dict:
+    return {
+        "race_id": int(row["id"]),
+        "日付": row["race_date"],
+        "場": row["venue"],
+        "R": int(row["race_no"]),
+        "発走": row.get("start_time", ""),
+        "締切": row.get("close_time", ""),
+        "レース": row.get("race_title") or "無題",
+        "状態": row.get("status", ""),
+        "未入力": issue,
+    }
+
+
+def build_unbet_race_queue(races: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
+    if races.empty:
+        return pd.DataFrame()
+    rows = [
+        queue_row(row, "買い目")
+        for _, row in sort_latest_races(races).iterrows()
+        if int(row.get("bet_count", 0) or 0) == 0
+    ]
+    return pd.DataFrame(rows).head(limit)
+
+
+def build_missing_bet_reason_queue(races: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
+    if races.empty:
+        return pd.DataFrame()
+    rows = [
+        queue_row(row, f"理由 {int(row.get('missing_bet_reason_count', 0) or 0)}件")
+        for _, row in sort_latest_races(races).iterrows()
+        if int(row.get("missing_bet_reason_count", 0) or 0) > 0
+    ]
+    return pd.DataFrame(rows).head(limit)
+
+
+def build_unreviewed_race_queue(races: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
+    if races.empty:
+        return pd.DataFrame()
+    rows = [
+        queue_row(row, "振り返り")
+        for _, row in sort_latest_races(races).iterrows()
+        if int(row.get("review_done", 0) or 0) == 0
+    ]
+    return pd.DataFrame(rows).head(limit)
 
 
 def build_research_queue(races: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
@@ -1465,9 +2108,12 @@ def build_research_queue(races: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
             continue
         rows.append(
             {
+                "race_id": int(row["id"]),
                 "日付": row["race_date"],
                 "場": row["venue"],
                 "R": int(row["race_no"]),
+                "発走": row.get("start_time", ""),
+                "締切": row.get("close_time", ""),
                 "レース": row.get("race_title") or "無題",
                 "状態": row.get("status", ""),
                 "研究キュー": " / ".join(issues),
@@ -1483,6 +2129,759 @@ def line_with_names(car_numbers: str, names: dict[int, str]) -> str:
         name = names.get(number, "")
         labels.append(f"{number} {name}" if name else str(number))
     return " - ".join(labels)
+
+
+def normalize_line_groups(line_groups: tuple[tuple[int, ...], ...] | list[tuple[int, ...]]) -> tuple[tuple[int, ...], ...]:
+    normalized: list[tuple[int, ...]] = []
+    used: set[int] = set()
+    for group in line_groups:
+        clean_group: list[int] = []
+        for raw_number in group:
+            number = int(raw_number)
+            if number < 1 or number > 9 or number in clean_group or number in used:
+                continue
+            clean_group.append(number)
+            used.add(number)
+        if clean_group:
+            normalized.append(tuple(clean_group))
+    return tuple(normalized)
+
+
+def flatten_line_groups(line_groups: tuple[tuple[int, ...], ...] | list[tuple[int, ...]]) -> tuple[int, ...]:
+    return tuple(number for group in line_groups for number in group)
+
+
+def format_line_groups(line_groups: tuple[tuple[int, ...], ...] | list[tuple[int, ...]]) -> str:
+    return " / ".join("-".join(str(number) for number in group) for group in line_groups)
+
+
+def format_car_label(car_no: int, names: dict[int, str]) -> str:
+    name = names.get(int(car_no), "")
+    return f"{int(car_no)} {name}" if name else str(int(car_no))
+
+
+def line_group_label(index: int, group: tuple[int, ...] | list[int], names: dict[int, str]) -> str:
+    return f"ライン{index + 1}: " + " - ".join(format_car_label(number, names) for number in group)
+
+
+def race_line_groups(race: dict, lines: pd.DataFrame) -> tuple[tuple[int, ...], ...]:
+    groups: list[tuple[int, ...]] = []
+    if not lines.empty:
+        for _, row in lines.iterrows():
+            parsed = parse_line_summary(row.get("car_numbers", ""))
+            if parsed:
+                groups.append(parsed[0])
+    if not groups:
+        groups = list(parse_line_summary(race.get("line_summary", "")))
+    return normalize_line_groups(groups)
+
+
+def move_line_group(
+    line_groups: tuple[tuple[int, ...], ...] | list[tuple[int, ...]],
+    active_index: int,
+    target_index: int,
+) -> tuple[tuple[int, ...], ...]:
+    groups = [tuple(group) for group in line_groups]
+    if not groups:
+        return ()
+    active_index = max(0, min(int(active_index), len(groups) - 1))
+    target_index = max(0, min(int(target_index), len(groups) - 1))
+    group = groups.pop(active_index)
+    groups.insert(target_index, group)
+    return tuple(groups)
+
+
+def scenario_options_for_group(group: tuple[int, ...]) -> list[str]:
+    options = ["ライン順走", "別線まくり", "競り・分断"]
+    if len(group) >= 2:
+        options.insert(1, "番手差し")
+    if len(group) == 1:
+        options.insert(0, "単騎差し込み")
+    return options
+
+
+def unique_top_numbers(numbers: list[int] | tuple[int, ...]) -> tuple[int, ...]:
+    top_numbers: list[int] = []
+    for raw_number in numbers:
+        number = int(raw_number)
+        if number > 0 and number not in top_numbers:
+            top_numbers.append(number)
+        if len(top_numbers) >= 3:
+            break
+    return tuple(top_numbers)
+
+
+def project_development_top3(
+    line_groups: tuple[tuple[int, ...], ...] | list[tuple[int, ...]],
+    active_index: int,
+    scenario: str,
+) -> tuple[int, ...]:
+    groups = [tuple(group) for group in line_groups if group]
+    if not groups:
+        return ()
+    active_index = max(0, min(int(active_index), len(groups) - 1))
+    active = groups[active_index]
+    others = [group for index, group in enumerate(groups) if index != active_index]
+
+    if scenario == "番手差し" and len(active) >= 2:
+        return unique_top_numbers([active[1], active[0], *active[2:], *flatten_line_groups(others)])
+    if scenario == "競り・分断":
+        other_leaders = [group[0] for group in others if group]
+        other_followers = [number for group in others for number in group[1:]]
+        return unique_top_numbers([active[0], *other_leaders, *(active[1:] if len(active) > 1 else ()), *other_followers])
+    if scenario == "単騎差し込み":
+        single = active if len(active) == 1 else next((group for group in groups if len(group) == 1), active)
+        remaining = [number for number in flatten_line_groups(groups) if number not in single]
+        return unique_top_numbers([*single, *remaining])
+    if scenario == "別線まくり":
+        return unique_top_numbers([*active[:2], *(others[0][:1] if others else ()), *active[2:], *flatten_line_groups(others)])
+    return unique_top_numbers([*active, *flatten_line_groups(others)])
+
+
+def empty_development_history() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "race_id",
+            "race_date",
+            "venue",
+            "grade",
+            "car_numbers",
+            "line_size",
+            "line_function",
+            "line_exact_top2",
+            "leader_first",
+            "leader_top3",
+            "second_first",
+            "second_top3",
+            "third_top3",
+            "single_top3",
+            "line_top3_sweep",
+            "line_collapse",
+            "matched_top3",
+            "winner_position",
+        ]
+    )
+
+
+def fetch_development_history() -> pd.DataFrame:
+    with get_conn() as conn:
+        lines = pd.read_sql_query(
+            """
+            SELECT
+                l.race_id,
+                r.race_date,
+                r.venue,
+                r.grade,
+                l.car_numbers
+            FROM race_lines l
+            JOIN races r ON r.id = l.race_id
+            WHERE COALESCE(l.car_numbers, '') <> ''
+            """,
+            conn,
+        )
+        result_rows = pd.read_sql_query(
+            """
+            SELECT race_id, finish_order, car_no
+            FROM race_result_rows
+            WHERE finish_order > 0 AND car_no > 0
+            ORDER BY race_id, finish_order, car_no
+            """,
+            conn,
+        )
+    if lines.empty or result_rows.empty:
+        return empty_development_history()
+
+    result_map: dict[int, tuple[int, ...]] = {}
+    for race_id, rows in result_rows.groupby("race_id", sort=False):
+        result_map[int(race_id)] = unique_top_numbers(rows.sort_values(["finish_order", "car_no"])["car_no"].astype(int).tolist())
+
+    history_rows: list[dict] = []
+    for _, line in lines.iterrows():
+        race_id = int(line["race_id"])
+        result = result_map.get(race_id, ())
+        if not result:
+            continue
+        parsed = parse_line_summary(line["car_numbers"])
+        if not parsed:
+            continue
+        line_numbers = tuple(parsed[0])
+        if not line_numbers:
+            continue
+        top_set = set(result[:3])
+        line_set = set(line_numbers)
+        matched = len(line_set.intersection(top_set))
+        leader = line_numbers[0]
+        second = line_numbers[1] if len(line_numbers) >= 2 else None
+        third = line_numbers[2] if len(line_numbers) >= 3 else None
+        winner = result[0] if result else 0
+        winner_position = "別線"
+        if winner == leader:
+            winner_position = "先頭"
+        elif second and winner == second:
+            winner_position = "番手"
+        elif third and winner == third:
+            winner_position = "3番手"
+        elif len(line_numbers) == 1 and winner == leader:
+            winner_position = "単騎"
+        elif winner in line_set:
+            winner_position = "ライン内"
+
+        history_rows.append(
+            {
+                "race_id": race_id,
+                "race_date": line["race_date"],
+                "venue": line["venue"] or "",
+                "grade": line["grade"] or "",
+                "car_numbers": "-".join(str(number) for number in line_numbers),
+                "line_size": len(line_numbers),
+                "line_function": int((matched >= 2) if len(line_numbers) >= 2 else (leader in top_set)),
+                "line_exact_top2": int(len(line_numbers) >= 2 and len(result) >= 2 and result[0] == leader and result[1] == second)
+                if len(line_numbers) >= 2
+                else None,
+                "leader_first": int(winner == leader),
+                "leader_top3": int(leader in top_set),
+                "second_first": int(winner == second) if second else None,
+                "second_top3": int(second in top_set) if second else None,
+                "third_top3": int(third in top_set) if third else None,
+                "single_top3": int(leader in top_set) if len(line_numbers) == 1 else None,
+                "line_top3_sweep": int(len(line_numbers) >= 3 and set(line_numbers[:3]).issubset(top_set))
+                if len(line_numbers) >= 3
+                else None,
+                "line_collapse": int(matched <= 1) if len(line_numbers) >= 2 else None,
+                "matched_top3": matched,
+                "winner_position": winner_position,
+            }
+        )
+
+    if not history_rows:
+        return empty_development_history()
+    return pd.DataFrame(history_rows)
+
+
+def select_development_sample(history: pd.DataFrame, active_group: tuple[int, ...], race: dict) -> tuple[pd.DataFrame, str]:
+    if history.empty:
+        return history, "過去データなし"
+    line_size = len(active_group)
+    same_size = history[history["line_size"].astype(int) == line_size].copy()
+    if same_size.empty:
+        return history, "全ライン"
+
+    venue = str(race.get("venue", "") or "")
+    grade = str(race.get("grade", "") or "")
+    if venue and grade:
+        same_venue_grade = same_size[(same_size["venue"] == venue) & (same_size["grade"] == grade)]
+        if len(same_venue_grade) >= 5:
+            return same_venue_grade, f"{venue} / {grade} / {line_size}車ライン"
+    if venue:
+        same_venue = same_size[same_size["venue"] == venue]
+        if len(same_venue) >= 5:
+            return same_venue, f"{venue} / {line_size}車ライン"
+    if grade:
+        same_grade = same_size[same_size["grade"] == grade]
+        if len(same_grade) >= 5:
+            return same_grade, f"{grade} / {line_size}車ライン"
+    return same_size, f"{line_size}車ライン全体"
+
+
+def probability_from_metric(sample: pd.DataFrame, metric: str) -> dict:
+    if sample.empty or metric not in sample.columns:
+        return {"hits": 0, "total": 0, "rate": 0.0}
+    values = sample[metric].dropna()
+    if values.empty:
+        return {"hits": 0, "total": 0, "rate": 0.0}
+    hits = int(values.astype(int).sum())
+    total = int(len(values))
+    return {"hits": hits, "total": total, "rate": hit_rate(hits, total)}
+
+
+def development_metric_plan(active_group: tuple[int, ...]) -> list[tuple[str, str]]:
+    if len(active_group) == 1:
+        return [("単騎3着内", "single_top3"), ("単騎1着", "leader_first")]
+    plan = [
+        ("ライン機能", "line_function"),
+        ("ライン順走", "line_exact_top2"),
+        ("先頭1着", "leader_first"),
+        ("番手1着", "second_first"),
+        ("崩れ", "line_collapse"),
+    ]
+    if len(active_group) >= 3:
+        plan.extend([("ライン3車上位独占", "line_top3_sweep"), ("3番手3着内", "third_top3")])
+    return plan
+
+
+def build_development_probability_summary(
+    history: pd.DataFrame,
+    active_group: tuple[int, ...],
+    race: dict,
+    scenario: str,
+) -> tuple[pd.DataFrame, dict, str]:
+    sample, scope = select_development_sample(history, active_group, race)
+    rows: list[dict] = []
+    for label, metric in development_metric_plan(active_group):
+        probability = probability_from_metric(sample, metric)
+        rows.append(
+            {
+                "項目": label,
+                "確率": probability["rate"],
+                "該当": probability["hits"],
+                "件数": probability["total"],
+                "metric": metric,
+            }
+        )
+    summary = pd.DataFrame(rows)
+    scenario_metric = DEVELOPMENT_SCENARIOS.get(scenario, {}).get("metric", "line_function")
+    focus_rows = summary[summary["metric"] == scenario_metric] if not summary.empty else pd.DataFrame()
+    focus = focus_rows.iloc[0].to_dict() if not focus_rows.empty else {"項目": scenario, "確率": 0.0, "該当": 0, "件数": 0}
+    return summary.drop(columns=["metric"], errors="ignore"), focus, scope
+
+
+def mean_or_zero(values: list[float]) -> float:
+    clean_values = [float(value) for value in values if value is not None]
+    if not clean_values:
+        return 0.0
+    return round(sum(clean_values) / len(clean_values), 1)
+
+
+def rider_dict_by_car(riders: pd.DataFrame) -> dict[int, dict]:
+    if riders.empty:
+        return {}
+    return {int(row["car_no"]): dict(row) for _, row in riders.iterrows()}
+
+
+def rider_forecast_scores(riders: pd.DataFrame) -> dict[int, float]:
+    if riders.empty:
+        return {}
+    racing_scores = [float(value or 0) for value in riders["racing_score"].fillna(0).tolist()]
+    active_racing = [value for value in racing_scores if value > 0]
+    min_racing = min(active_racing) if active_racing else 0.0
+    max_racing = max(active_racing) if active_racing else 0.0
+    mark_bonus = {"◎": 8.0, "○": 5.0, "▲": 3.0, "△": 1.5, "☆": 1.0}
+
+    scores: dict[int, float] = {}
+    for _, row in riders.iterrows():
+        racing_score = float(row.get("racing_score", 0) or 0)
+        if max_racing > min_racing and racing_score > 0:
+            normalized_racing = 45.0 + ((racing_score - min_racing) / (max_racing - min_racing)) * 45.0
+        elif racing_score > 0:
+            normalized_racing = 70.0
+        else:
+            normalized_racing = 50.0
+        subjective_score = float(row.get("総合", 50) or 50)
+        bonus = mark_bonus.get(str(row.get("final_mark", "") or ""), 0.0)
+        scores[int(row["car_no"])] = round(min(normalized_racing * 0.65 + subjective_score * 0.35 + bonus, 100.0), 1)
+    return scores
+
+
+def line_watch_point(group: tuple[int, ...], probability: dict[str, dict]) -> str:
+    if len(group) == 1:
+        top3 = probability.get("single_top3", {}).get("rate", 0.0)
+        return f"単騎3着内 {top3:.1f}% を見て、位置取り待ちにするか判断"
+    line_function = probability.get("line_function", {}).get("rate", 0.0)
+    second_first = probability.get("second_first", {}).get("rate", 0.0)
+    collapse = probability.get("line_collapse", {}).get("rate", 0.0)
+    if collapse >= line_function:
+        return f"崩れ {collapse:.1f}% が高め。別線・単騎の差し込みを確認"
+    if len(group) >= 2 and second_first >= 20:
+        return f"番手1着 {second_first:.1f}% あり。折り返し候補"
+    return f"ライン機能 {line_function:.1f}% を軸候補として確認"
+
+
+def build_prerace_line_reference(
+    line_groups: tuple[tuple[int, ...], ...],
+    riders: pd.DataFrame,
+    race: dict,
+    history: pd.DataFrame,
+    names: dict[int, str],
+) -> pd.DataFrame:
+    rider_lookup = rider_dict_by_car(riders)
+    score_map = rider_forecast_scores(riders)
+    rows: list[dict] = []
+    for index, group in enumerate(line_groups):
+        sample, scope = select_development_sample(history, group, race)
+        metrics = {
+            metric: probability_from_metric(sample, metric)
+            for _, metric in development_metric_plan(group)
+        }
+        racing_values = [float(rider_lookup.get(number, {}).get("racing_score", 0) or 0) for number in group]
+        forecast_values = [score_map.get(number, 50.0) for number in group]
+        leader = group[0]
+        second = group[1] if len(group) >= 2 else 0
+        rows.append(
+            {
+                "ライン": f"ライン{index + 1}",
+                "並び": " - ".join(format_car_label(number, names) for number in group),
+                "人数": len(group),
+                "先頭": format_car_label(leader, names),
+                "番手": format_car_label(second, names) if second else "",
+                "平均競走得点": mean_or_zero([value for value in racing_values if value > 0]),
+                "参考指数": mean_or_zero(forecast_values),
+                "ライン機能率": metrics.get("line_function", {}).get("rate", 0.0),
+                "番手1着率": metrics.get("second_first", {}).get("rate", 0.0),
+                "崩れ率": metrics.get("line_collapse", {}).get("rate", 0.0),
+                "サンプル": metrics.get("line_function", metrics.get("single_top3", {})).get("total", 0),
+                "集計範囲": scope,
+                "見るポイント": line_watch_point(group, metrics),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_prerace_scenario_candidates(
+    line_groups: tuple[tuple[int, ...], ...],
+    riders: pd.DataFrame,
+    race: dict,
+    history: pd.DataFrame,
+    names: dict[int, str],
+) -> pd.DataFrame:
+    score_map = rider_forecast_scores(riders)
+    rows: list[dict] = []
+    for line_index, group in enumerate(line_groups):
+        line_values = [score_map.get(number, 50.0) for number in group]
+        line_score = mean_or_zero(line_values) or 50.0
+        for scenario in scenario_options_for_group(group):
+            top3 = project_development_top3(line_groups, line_index, scenario)
+            scenario_metric = DEVELOPMENT_SCENARIOS.get(scenario, {}).get("metric", "line_function")
+            sample, scope = select_development_sample(history, group, race)
+            probability = probability_from_metric(sample, scenario_metric)
+            top_values = [score_map.get(number, 50.0) for number in top3]
+            top_score = mean_or_zero(top_values) or 50.0
+            sample_weight = min(float(probability["total"]) / 20.0, 1.0)
+            reference_index = round((probability["rate"] * 0.5 * sample_weight) + (top_score * 0.35) + (line_score * 0.15), 1)
+            rows.append(
+                {
+                    "ライン": f"ライン{line_index + 1}",
+                    "展開": scenario,
+                    "想定上位": " - ".join(format_car_label(number, names) for number in top3),
+                    "過去目安": probability["rate"],
+                    "該当": probability["hits"],
+                    "件数": probability["total"],
+                    "選手指数": top_score,
+                    "参考指数": reference_index,
+                    "集計範囲": scope,
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["参考指数", "過去目安", "選手指数"], ascending=False).reset_index(drop=True)
+
+
+def prerace_note_text(
+    race: dict,
+    line_reference: pd.DataFrame,
+    scenario_candidates: pd.DataFrame,
+) -> str:
+    race_label_text = f"{race.get('venue', '')} {race.get('race_no', '')}R"
+    if line_reference.empty or scenario_candidates.empty:
+        return f"{race_label_text} 開催前メモ\nライン構成、選手評価、過去目安を確認する。"
+    top_line = line_reference.sort_values(["参考指数", "ライン機能率"], ascending=False).iloc[0]
+    top_scenario = scenario_candidates.iloc[0]
+    return (
+        f"{race_label_text} 開催前メモ\n"
+        f"注目ライン: {top_line['ライン']} {top_line['並び']}\n"
+        f"見るポイント: {top_line['見るポイント']}\n"
+        f"展開候補: {top_scenario['展開']} / {top_scenario['想定上位']}\n"
+        f"過去目安: {top_scenario['過去目安']}% ({int(top_scenario['該当'])}/{int(top_scenario['件数'])}, {top_scenario['集計範囲']})\n"
+        "判断: ここに自分の読み、切る車番、押さえる形を追記する。"
+    )
+
+
+def render_prerace_reference_panel(
+    race: dict,
+    line_groups: tuple[tuple[int, ...], ...],
+    riders: pd.DataFrame,
+    history: pd.DataFrame,
+    names: dict[int, str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    st.markdown("#### 開催前の予想材料")
+    if riders.empty:
+        st.info("選手情報を補完すると、ライン別の参考指数とシナリオ候補を表示できます。")
+        return pd.DataFrame(), pd.DataFrame()
+
+    line_reference = build_prerace_line_reference(line_groups, riders, race, history, names)
+    scenario_candidates = build_prerace_scenario_candidates(line_groups, riders, race, history, names)
+    if line_reference.empty:
+        st.info("ライン構成を入力すると、開催前の予想材料を表示できます。")
+        return line_reference, scenario_candidates
+
+    best_line = line_reference.sort_values(["参考指数", "ライン機能率"], ascending=False).iloc[0]
+    best_scenario = scenario_candidates.iloc[0] if not scenario_candidates.empty else {}
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("ライン数", f"{len(line_groups)}")
+    col2.metric("補完選手", f"{len(riders)}")
+    col3.metric("注目ライン", str(best_line["ライン"]), f"{float(best_line['参考指数']):.1f}")
+    col4.metric("上位展開", str(best_scenario.get("展開", "未計算")), f"{float(best_scenario.get('参考指数', 0.0)):.1f}")
+
+    st.dataframe(
+        line_reference,
+        use_container_width=True,
+        hide_index=True,
+    )
+    if not scenario_candidates.empty:
+        st.markdown("#### 展開候補")
+        st.dataframe(
+            scenario_candidates.head(12),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.text_area("開催前メモ草案", value=prerace_note_text(race, line_reference, scenario_candidates), height=140)
+    return line_reference, scenario_candidates
+
+
+def virtual_bank_html(
+    line_groups: tuple[tuple[int, ...], ...],
+    active_index: int,
+    projected_top3: tuple[int, ...],
+    names: dict[int, str],
+) -> str:
+    total = len(flatten_line_groups(line_groups))
+    if total == 0:
+        return ""
+
+    active_numbers = set(line_groups[active_index]) if 0 <= active_index < len(line_groups) else set()
+    projected_rank = {number: index + 1 for index, number in enumerate(projected_top3)}
+    chips: list[str] = []
+    chip_index = 0
+    spread = 320 if total > 1 else 0
+    for line_index, group in enumerate(line_groups):
+        color = BANK_LINE_COLORS[line_index % len(BANK_LINE_COLORS)]
+        for number in group:
+            angle = math.radians(-24 + (spread * chip_index / max(total - 1, 1)))
+            left = 50 + 40 * math.cos(angle)
+            top = 50 + 34 * math.sin(angle)
+            classes = ["rider-chip"]
+            if number in active_numbers:
+                classes.append("is-active")
+            if number in projected_rank:
+                classes.append("is-projected")
+            rank_html = f"<span class='rider-rank'>{projected_rank[number]}着</span>" if number in projected_rank else ""
+            chips.append(
+                (
+                    f'<div class="{" ".join(classes)}" '
+                    f'style="left:{left:.1f}%; top:{top:.1f}%; --line-color:{color};">'
+                    f"{rank_html}"
+                    f'<span class="rider-no">{int(number)}</span>'
+                    f"<strong>{html.escape(f'ライン{line_index + 1}')}</strong>"
+                    f'<span class="rider-name">{html.escape(names.get(int(number), ""))}</span>'
+                    "</div>"
+                )
+            )
+            chip_index += 1
+
+    return "".join(
+        [
+            '<div class="virtual-bank">',
+            f'<div class="bank-center-label">仮想バンク<br>{html.escape(format_line_groups(line_groups))}</div>',
+            *chips,
+            "</div>",
+        ]
+    )
+
+
+def render_virtual_bank(
+    line_groups: tuple[tuple[int, ...], ...],
+    active_index: int,
+    projected_top3: tuple[int, ...],
+    names: dict[int, str],
+) -> None:
+    bank_html = virtual_bank_html(line_groups, active_index, projected_top3, names)
+    if not bank_html:
+        st.info("ライン構成を入力すると仮想バンクを表示します。")
+        return
+    st.markdown(bank_html, unsafe_allow_html=True)
+
+
+def development_note_text(
+    race: dict,
+    active_label: str,
+    scenario: str,
+    projected_top3: tuple[int, ...],
+    focus: dict,
+    scope: str,
+    names: dict[int, str],
+) -> str:
+    top_text = " - ".join(format_car_label(number, names) for number in projected_top3) or "未設定"
+    return (
+        f"{race.get('venue', '')} {race.get('race_no', '')}R 展開仮説\n"
+        f"狙いライン: {active_label}\n"
+        f"展開タイプ: {scenario}（{DEVELOPMENT_SCENARIOS.get(scenario, {}).get('summary', '')}）\n"
+        f"想定上位: {top_text}\n"
+        f"過去目安: {focus.get('項目', scenario)} {focus.get('確率', 0.0)}% "
+        f"({int(focus.get('該当', 0))}/{int(focus.get('件数', 0))}, {scope})"
+    )
+
+
+def display_queue_table(df: pd.DataFrame, *, key: str, empty_message: str, target_page: str = "買い目・結果") -> None:
+    if df.empty:
+        st.caption(empty_message)
+        return
+    display_df = df.drop(columns=["race_id"], errors="ignore")
+    state = st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        key=key,
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+    selected_rows = getattr(getattr(state, "selection", None), "rows", [])
+    if not selected_rows:
+        return
+    selected_race_id = int(df.iloc[int(selected_rows[0])]["race_id"])
+    handled_key = f"{key}_handled_race_id"
+    if st.session_state.get(handled_key) == selected_race_id:
+        return
+    st.session_state[handled_key] = selected_race_id
+    st.session_state["selected_race_id"] = selected_race_id
+    st.session_state["page"] = target_page
+    st.rerun()
+
+
+def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> None:
+    today_text = date.today().isoformat()
+    st.subheader("本日開催")
+    col_info, col_action = st.columns([3, 1])
+    with col_info:
+        if sync_result and sync_result.get("error"):
+            st.warning(f"{today_text} のWINTICKET開催一覧を更新できませんでした: {sync_result['error']}")
+        elif sync_result:
+            details = sync_result.get("details") or {}
+            detail_text = ""
+            if details:
+                detail_text = f" / 補完{len(details.get('synced', []))}件 / 失敗{len(details.get('failed', []))}件"
+            st.caption(
+                f"{sync_result['race_date']} 更新: 取得{sync_result['fetched']}件 / "
+                f"新規{sync_result['created']}件 / 更新{sync_result['updated']}件{detail_text}"
+            )
+        else:
+            st.caption("アプリ起動・再読み込み時にWINTICKET開催一覧を確認します。")
+    with col_action:
+        if st.button("本日開催を更新", use_container_width=True):
+            with st.spinner("WINTICKETの本日開催を更新しています..."):
+                try:
+                    result = sync_winticket_race_list_for_date(today_text)
+                except Exception as exc:
+                    st.session_state["winticket_today_sync_result"] = {
+                        "race_date": today_text,
+                        "error": str(exc),
+                        "fetched": 0,
+                        "created": 0,
+                        "updated": 0,
+                    }
+                    st.error(f"更新に失敗しました: {exc}")
+                else:
+                    st.session_state["winticket_today_sync_result"] = result
+                    details = result.get("details") or {}
+                    detail_text = ""
+                    if details:
+                        detail_text = f" / 補完{len(details.get('synced', []))}件 / 失敗{len(details.get('failed', []))}件"
+                    st.success(f"本日開催を更新しました。新規{result['created']}件 / 更新{result['updated']}件{detail_text}")
+                st.rerun()
+
+    if races.empty:
+        st.info("本日開催の登録レースはまだありません。")
+        return
+
+    today_races = sort_latest_races(races[races["race_date"] == today_text])
+    if today_races.empty:
+        st.info("本日開催の登録レースはまだありません。更新ボタンでWINTICKETから取得できます。")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("本日レース", f"{len(today_races)}")
+    col2.metric("未買い目", f"{int((today_races['bet_count'].fillna(0).astype(int) == 0).sum())}")
+    col3.metric("理由なし", f"{int((today_races['missing_bet_reason_count'].fillna(0).astype(int) > 0).sum())}")
+    col4.metric("未振り返り", f"{int((today_races['review_done'].fillna(0).astype(int) == 0).sum())}")
+
+    today_view = today_races.copy()
+    today_view["race_id"] = today_view["id"].astype(int)
+    today_view["未入力"] = today_view.apply(lambda row: " / ".join(research_issues(row)) or "完了", axis=1)
+    select_labels = [
+        f"{row['venue']} {int(row['race_no'])}R {row.get('start_time') or '--:--'} / {row.get('status') or ''} / {row.get('race_title') or '無題'}"
+        for _, row in today_view.iterrows()
+    ]
+    today_ids = [int(row["race_id"]) for _, row in today_view.iterrows()]
+    selected_state_id = st.session_state.get("selected_race_id")
+    try:
+        selected_state_id = int(selected_state_id) if selected_state_id is not None else None
+    except (TypeError, ValueError):
+        selected_state_id = None
+    default_select_index = today_ids.index(selected_state_id) if selected_state_id in today_ids else 0
+    col_select, col_open, col_hydrate = st.columns([3, 1, 1])
+    selected_today_label = col_select.selectbox(
+        "本日開催からレースを選択",
+        select_labels,
+        index=default_select_index,
+        key="today_race_selector",
+    )
+    selected_today_id = today_ids[select_labels.index(selected_today_label)]
+    if col_open.button("選択レースを開く", use_container_width=True):
+        st.session_state["selected_race_id"] = selected_today_id
+        st.session_state["page"] = "買い目・結果"
+        st.rerun()
+    if col_hydrate.button("補完して開く", use_container_width=True):
+        with st.spinner("選択レースの選手・ライン・結果を補完しています..."):
+            try:
+                source = sync_winticket_for_race(selected_today_id)
+            except Exception as exc:
+                st.error(f"選択レースの補完に失敗しました: {exc}")
+            else:
+                st.success(f"補完完了: 選手{len(source.riders)}名 / ライン{len(parse_line_summary(source.line_summary))}件 / 結果{len(source.result_rows)}行")
+                st.session_state["selected_race_id"] = selected_today_id
+                st.session_state["page"] = "買い目・結果"
+                st.rerun()
+
+    col_batch_count, col_batch_run = st.columns([1, 3])
+    batch_limit = col_batch_count.selectbox("随時補完", [3, 5, 10, 20], index=1, key="today_batch_hydrate_limit")
+    if col_batch_run.button("本日未補完を少し補完", use_container_width=True):
+        with st.spinner(f"本日未補完レースを{int(batch_limit)}件まで補完しています..."):
+            result = sync_winticket_details_for_race_ids(today_ids, limit=int(batch_limit))
+        st.session_state["winticket_today_sync_result"] = {
+            "race_date": today_text,
+            "fetched": len(today_ids),
+            "created": 0,
+            "updated": len(today_ids),
+            "race_ids": today_ids,
+            "details": result,
+        }
+        if result["synced"]:
+            st.success(f"{len(result['synced'])}件を補完しました。")
+            st.dataframe(pd.DataFrame(result["synced"]), use_container_width=True, hide_index=True)
+        if result["failed"]:
+            st.warning(f"{len(result['failed'])}件は補完できませんでした。")
+            st.dataframe(pd.DataFrame(result["failed"]), use_container_width=True, hide_index=True)
+        st.rerun()
+
+    display_queue_table(
+        today_view[
+            [
+                "race_id",
+                "race_date",
+                "venue",
+                "race_no",
+                "start_time",
+                "close_time",
+                "race_title",
+                "status",
+                "source_status",
+                "bet_count",
+                "未入力",
+            ]
+        ].rename(
+            columns={
+                "race_date": "日付",
+                "venue": "場",
+                "race_no": "R",
+                "start_time": "発走",
+                "close_time": "締切",
+                "race_title": "レース",
+                "status": "状態",
+                "source_status": "取得状態",
+                "bet_count": "買い目数",
+            }
+        ),
+        key="today_races_table",
+        empty_message="本日開催の登録レースはありません。",
+    )
 
 
 def render_winticket_sync_panel(selected_race_id: int | None, races: pd.DataFrame | None = None) -> None:
@@ -1689,6 +3088,8 @@ def render_selected_race_research(selected_race_id: int | None) -> None:
                         "payout",
                         "hit",
                         "expected_role",
+                        "strategy_type",
+                        "prediction_source",
                         "note",
                     ]
                 ].rename(
@@ -1699,7 +3100,9 @@ def render_selected_race_research(selected_race_id: int | None) -> None:
                         "payout": "払戻",
                         "hit": "的中",
                         "expected_role": "位置づけ",
-                        "note": "メモ",
+                        "strategy_type": "買い方の型",
+                        "prediction_source": "予想区分",
+                        "note": "買い目理由",
                     }
                 ),
                 use_container_width=True,
@@ -1779,7 +3182,7 @@ def render_rider_purchase_insights() -> None:
     col1.metric("対象選手", f"{len(view)}人")
     col2.metric("買い目登場", f"{int(view['買い目登場数'].sum()):,}回")
     col3.metric("最多購入", str(top_rider["選手"]))
-    col4.metric("購入額", amount_text(int(top_rider["購入額"]), selected_unit))
+    col4.metric("購入額", metric_amount_text(int(top_rider["購入額"]), selected_unit))
 
     fig = horizontal_bar(
         top,
@@ -1819,17 +3222,16 @@ def render_rider_purchase_insights() -> None:
     )
 
 
-def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
+def render_dashboard(races: pd.DataFrame, selected_race_id: int | None, sync_result: dict | None = None) -> None:
     render_header(None)
     if races.empty:
+        render_today_races_panel(races, sync_result)
         st.info("まずはレース登録から始めます。サイドバーのサンプル投入も使えます。")
         return
 
     bets = fetch_all_bets()
-    total_stake = int(bets["stake"].sum()) if not bets.empty else 0
-    total_payout = int(bets["payout"].sum()) if not bets.empty else 0
-    hit_count = int(bets["hit"].sum()) if not bets.empty else 0
     unit = summary_unit(bets)
+    hit_count = int(bets["hit"].sum()) if not bets.empty else 0
     race_count = len(races)
     rider_done = int((races["rider_count"] > 0).sum())
     line_done = int((races["line_count"] > 0).sum())
@@ -1842,39 +3244,43 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
     col4.metric("振り返り完了率", rate_text(review_done, race_count), f"{review_done}/{race_count}")
     col5.metric("的中率", f"{hit_rate(hit_count, len(bets))}%" if not bets.empty else "0.0%")
 
+    render_today_races_panel(races, sync_result)
+
     render_winticket_sync_panel(selected_race_id, races)
 
     st.markdown("#### 投票トレーニング集計")
-    if bets.empty:
-        st.info("買い目を登録すると、投票癖と的中精度の分析が始まります。")
-    elif is_tip_medal(unit):
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("利用合計", amount_text(total_stake, unit))
-        col2.metric("的中払戻", amount_text(total_payout, unit))
-        col3.metric("残り目安", amount_text(remaining_tip_medals(total_stake), unit))
-        col4.metric(net_label(unit), amount_text(profit(total_stake, total_payout), unit))
-        st.caption(
-            f"TIPメダルは毎日{TIP_MEDAL_DAILY_GRANT:,}枚から始まり、{TIP_MEDAL_RESET_TEXT}に失効します。"
-            "ここでは現金ではなく、買い目精度を鍛える持ち点として扱います。"
+    render_bet_performance_summary(bets)
+
+    st.subheader("入力キュー")
+    col_unbet, col_reason, col_review = st.columns(3)
+    with col_unbet:
+        st.markdown("#### 未買い目予想")
+        display_queue_table(
+            build_unbet_race_queue(races, limit=20),
+            key="unbet_queue_table",
+            empty_message="買い目未入力のレースはありません。",
         )
-    elif unit == "単位混在":
-        col1, col2, col3 = st.columns(3)
-        col1.metric("購入合計", amount_summary_text(bets, "stake"))
-        col2.metric("払戻合計", amount_summary_text(bets, "payout"))
-        col3.metric("差分", profit_summary_text(bets))
-    else:
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("購入合計", amount_text(total_stake, unit))
-        col2.metric("払戻合計", amount_text(total_payout, unit))
-        col3.metric(net_label(unit), amount_text(profit(total_stake, total_payout), unit))
-        col4.metric("回収率", f"{recovery_rate(total_stake, total_payout)}%")
+    with col_reason:
+        st.markdown("#### 買い目理由なし")
+        display_queue_table(
+            build_missing_bet_reason_queue(races, limit=20),
+            key="missing_reason_queue_table",
+            empty_message="買い目理由が空欄のレースはありません。",
+        )
+    with col_review:
+        st.markdown("#### 振り返り未完了")
+        display_queue_table(
+            build_unreviewed_race_queue(races, limit=20),
+            key="unreviewed_queue_table",
+            empty_message="振り返り未完了のレースはありません。",
+        )
 
     queue = build_research_queue(races)
     st.subheader("研究キュー")
     if queue.empty:
         st.success("未補完・未評価のレースはありません。いい感じに研究ノートが育っています。")
     else:
-        st.dataframe(queue, use_container_width=True, hide_index=True)
+        st.dataframe(queue.drop(columns=["race_id"], errors="ignore"), use_container_width=True, hide_index=True)
 
     st.subheader("競輪場特徴サマリ")
     venue_counts = races.groupby("venue").size().sort_values(ascending=False)
@@ -1890,6 +3296,7 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
     st.subheader("最近のレース")
     races_view = races.copy()
     races_view["差分"] = races_view["total_payout"] - races_view["total_stake"]
+    races_view["的中率"] = races_view.apply(lambda row: hit_rate(int(row["hit_count"]), int(row["bet_count"])), axis=1)
     races_view["回収率"] = races_view.apply(
         lambda row: recovery_rate(row["total_stake"], row["total_payout"]),
         axis=1,
@@ -1907,13 +3314,17 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
                 "race_date",
                 "venue",
                 "race_no",
+                "start_time",
+                "close_time",
                 "status",
                 "amount_unit",
                 "rider_count",
                 "line_count",
                 "result_row_count",
                 "bet_count",
+                "missing_bet_reason_count",
                 "hit_count",
+                "的中率",
                 "total_stake",
                 "total_payout",
                 "差分",
@@ -1925,12 +3336,15 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
                 "race_date": "日付",
                 "venue": "場",
                 "race_no": "R",
+                "start_time": "発走",
+                "close_time": "締切",
                 "status": "状態",
                 "amount_unit": "単位",
                 "rider_count": "選手数",
                 "line_count": "ライン数",
                 "result_row_count": "結果詳細",
                 "bet_count": "買い目数",
+                "missing_bet_reason_count": "理由なし",
                 "hit_count": "的中数",
                 "total_stake": "購入",
                 "total_payout": "払戻",
@@ -1992,6 +3406,7 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
             .reset_index()
         )
         ticket_summary["回収率"] = ticket_summary.apply(lambda row: recovery_rate(row["購入"], row["払戻"]), axis=1)
+        ticket_summary["的中率"] = ticket_summary.apply(lambda row: hit_rate(int(row["的中"]), int(row["件数"])), axis=1)
         ticket_summary["券種"] = ticket_summary["ticket_type"] + " / " + ticket_summary["amount_unit"]
         venue_summary = (
             bets.groupby(["amount_unit", "venue"])
@@ -1999,6 +3414,7 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
             .reset_index()
         )
         venue_summary["差分"] = venue_summary["払戻"] - venue_summary["購入"]
+        venue_summary["的中率"] = venue_summary.apply(lambda row: hit_rate(int(row["的中"]), int(row["件数"])), axis=1)
         venue_summary["場"] = venue_summary["venue"] + " / " + venue_summary["amount_unit"]
         col_c, col_d = st.columns(2)
         with col_c:
@@ -2010,7 +3426,7 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
                 continuous_color=True,
                 title="券種別 回収率",
                 x_title="回収率（%）",
-                hover_data=["購入", "払戻", "的中", "件数"],
+                hover_data=["購入", "払戻", "的中", "件数", "的中率"],
                 text_template="%{x:.1f}%",
                 color_scale=["#475569", "#38bdf8", "#22c55e"],
             )
@@ -2024,7 +3440,7 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None) -> None:
                 continuous_color=True,
                 title=f"競輪場別 {net_label(unit)}",
                 x_title=net_label(unit),
-                hover_data=["購入", "払戻", "的中", "件数"],
+                hover_data=["購入", "払戻", "的中", "件数", "的中率"],
                 text_template="%{x:,.0f}",
                 color_scale=["#ef4444", "#94a3b8", "#22c55e"],
             )
@@ -2318,6 +3734,178 @@ def render_riders(selected_race_id: int | None) -> None:
         )
 
 
+def render_development_forecast(selected_race_id: int | None) -> None:
+    if not selected_race_id:
+        render_header(None)
+        st.info("先にレースを登録してください。")
+        return
+
+    selected_race = fetch_race(selected_race_id)
+    lines = fetch_lines(selected_race_id)
+    names = rider_name_map(selected_race_id)
+    default_groups = race_line_groups(selected_race, lines)
+    groups_key = f"development_bank_groups_{selected_race_id}"
+    input_key = f"development_line_input_{selected_race_id}"
+    active_key = f"development_active_index_{selected_race_id}"
+    scenario_key = f"development_scenario_{selected_race_id}"
+    message_key = f"development_sync_message_{selected_race_id}"
+
+    if input_key not in st.session_state:
+        st.session_state[input_key] = format_line_groups(default_groups)
+    if groups_key not in st.session_state:
+        st.session_state[groups_key] = default_groups
+    if active_key not in st.session_state:
+        st.session_state[active_key] = 0
+    current_state_groups = normalize_line_groups(tuple(tuple(group) for group in st.session_state.get(groups_key, ())))
+    if default_groups and not current_state_groups and not str(st.session_state.get(input_key, "")).strip():
+        st.session_state[input_key] = format_line_groups(default_groups)
+        st.session_state[groups_key] = default_groups
+        st.session_state[active_key] = 0
+
+    render_header(selected_race)
+    st.subheader("展開予想")
+
+    sync_message = st.session_state.pop(message_key, None)
+    if sync_message:
+        if sync_message.get("level") == "warning":
+            st.warning(sync_message.get("text", ""))
+        else:
+            st.success(sync_message.get("text", ""))
+
+    source_race_id = selected_race.get("source_race_id") or extract_source_race_id(selected_race.get("race_memo", ""))
+    if not default_groups:
+        col_hydrate, col_hint = st.columns([1, 3])
+        if col_hydrate.button("WINTICKET補完", use_container_width=True, disabled=not bool(source_race_id)):
+            with st.spinner("選手・ライン・結果を補完しています..."):
+                try:
+                    source = sync_winticket_for_race(selected_race_id)
+                except Exception as exc:
+                    st.error(f"補完に失敗しました: {exc}")
+                else:
+                    refreshed_race = fetch_race(selected_race_id)
+                    refreshed_lines = fetch_lines(selected_race_id)
+                    refreshed_groups = race_line_groups(refreshed_race, refreshed_lines)
+                    if refreshed_groups:
+                        st.session_state[input_key] = format_line_groups(refreshed_groups)
+                        st.session_state[groups_key] = refreshed_groups
+                        st.session_state[active_key] = 0
+                        st.session_state[message_key] = {
+                            "level": "success",
+                            "text": f"補完完了: 選手{len(source.riders)}名 / ライン{len(refreshed_groups)}件。展開予想へ反映しました。",
+                        }
+                    else:
+                        st.session_state[message_key] = {
+                            "level": "warning",
+                            "text": "補完しましたが、ライン構成は見つかりませんでした。手入力でラインを入れてください。",
+                        }
+                    st.rerun()
+        if source_race_id:
+            col_hint.info("このレースは開催一覧だけ登録済みです。WINTICKET補完でライン構成を取得できます。")
+        else:
+            col_hint.info("ライン構成を手入力してください。例: 123ー456ー789 / 1-2-3 ・ 4-5")
+
+    col_input, col_apply, col_reset = st.columns([4, 1, 1])
+    if col_reset.button("登録ライン", use_container_width=True, disabled=not bool(default_groups)):
+        st.session_state[input_key] = format_line_groups(default_groups)
+        st.session_state[groups_key] = default_groups
+        st.session_state[active_key] = 0
+        st.rerun()
+    col_input.text_input("ライン構成", key=input_key, placeholder="例: 123ー456ー789 / 1-2-3 ・ 4-5")
+    if col_apply.button("反映", use_container_width=True):
+        parsed_groups = normalize_line_groups(parse_line_summary(st.session_state.get(input_key, "")))
+        if not parsed_groups:
+            st.error("ライン構成を読み取れませんでした。")
+        else:
+            st.session_state[groups_key] = parsed_groups
+            st.session_state[active_key] = 0
+            st.rerun()
+
+    line_groups = normalize_line_groups(tuple(tuple(group) for group in st.session_state.get(groups_key, ())))
+    if not line_groups:
+        st.info("ライン構成を入力すると、仮想バンクと過去確率を表示します。")
+        return
+
+    riders = fetch_riders(selected_race_id)
+    history = fetch_development_history()
+    render_prerace_reference_panel(selected_race, line_groups, riders, history, names)
+
+    active_index = max(0, min(int(st.session_state.get(active_key, 0) or 0), len(line_groups) - 1))
+    group_labels = [line_group_label(index, group, names) for index, group in enumerate(line_groups)]
+    selected_label = st.selectbox("狙いライン", group_labels, index=active_index)
+    active_index = group_labels.index(selected_label)
+    st.session_state[active_key] = active_index
+    active_group = line_groups[active_index]
+
+    col_front, col_prev, col_next, col_back, col_reverse = st.columns(5)
+    if col_front.button("先頭へ", use_container_width=True, disabled=active_index == 0):
+        st.session_state[groups_key] = move_line_group(line_groups, active_index, 0)
+        st.session_state[active_key] = 0
+        st.rerun()
+    if col_prev.button("一つ前へ", use_container_width=True, disabled=active_index == 0):
+        st.session_state[groups_key] = move_line_group(line_groups, active_index, active_index - 1)
+        st.session_state[active_key] = active_index - 1
+        st.rerun()
+    if col_next.button("一つ後ろへ", use_container_width=True, disabled=active_index >= len(line_groups) - 1):
+        st.session_state[groups_key] = move_line_group(line_groups, active_index, active_index + 1)
+        st.session_state[active_key] = active_index + 1
+        st.rerun()
+    if col_back.button("最後尾へ", use_container_width=True, disabled=active_index >= len(line_groups) - 1):
+        st.session_state[groups_key] = move_line_group(line_groups, active_index, len(line_groups) - 1)
+        st.session_state[active_key] = len(line_groups) - 1
+        st.rerun()
+    if col_reverse.button("隊列反転", use_container_width=True):
+        st.session_state[groups_key] = tuple(reversed(line_groups))
+        st.session_state[active_key] = len(line_groups) - 1 - active_index
+        st.rerun()
+
+    scenario_options = scenario_options_for_group(active_group)
+    if st.session_state.get(scenario_key) not in scenario_options:
+        st.session_state[scenario_key] = scenario_options[0]
+    scenario = st.radio("展開タイプ", scenario_options, horizontal=True, key=scenario_key)
+    projected_top3 = project_development_top3(line_groups, active_index, scenario)
+    probability_summary, focus, scope = build_development_probability_summary(history, active_group, selected_race, scenario)
+
+    bank_col, probability_col = st.columns([2, 1])
+    with bank_col:
+        render_virtual_bank(line_groups, active_index, projected_top3, names)
+    with probability_col:
+        st.markdown("#### 過去目安")
+        st.metric(
+            str(focus.get("項目", scenario)),
+            f"{float(focus.get('確率', 0.0)):.1f}%",
+            f"{int(focus.get('該当', 0))}/{int(focus.get('件数', 0))}",
+        )
+        st.caption(f"集計範囲: {scope}")
+        if projected_top3:
+            st.markdown("#### 想定上位")
+            for index, number in enumerate(projected_top3, start=1):
+                st.write(f"{index}着候補: {format_car_label(number, names)}")
+        st.caption("過去比率は保存済みレース内の目安で、的中や利益を保証するものではありません。")
+
+    order_rows = [
+        {
+            "隊列": index + 1,
+            "ライン": f"ライン{index + 1}",
+            "車番": "-".join(str(number) for number in group),
+            "名前付き": " - ".join(format_car_label(number, names) for number in group),
+        }
+        for index, group in enumerate(line_groups)
+    ]
+    col_order, col_probability = st.columns([1, 1])
+    with col_order:
+        st.markdown("#### 現在の隊列")
+        st.dataframe(pd.DataFrame(order_rows), use_container_width=True, hide_index=True)
+    with col_probability:
+        st.markdown("#### 確率内訳")
+        if probability_summary.empty:
+            st.info("結果補完済みの過去レースが増えると確率内訳を表示できます。")
+        else:
+            st.dataframe(probability_summary, use_container_width=True, hide_index=True)
+
+    note = development_note_text(selected_race, selected_label, scenario, projected_top3, focus, scope, names)
+    st.text_area("展開メモ草案", value=note, height=150)
+
+
 def render_bets_and_results(selected_race_id: int | None) -> None:
     if not selected_race_id:
         render_header(None)
@@ -2379,8 +3967,11 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
             )
             stake = col1.number_input(f"購入（{bet_unit}）", min_value=0, value=100, step=100)
             payout = col2.number_input(f"払戻（{bet_unit}）", min_value=0, value=0, step=100)
+            col3, col4 = st.columns(2)
+            strategy_type = col3.selectbox("買い方の型", STRATEGY_TYPES, index=0)
+            prediction_source = col4.selectbox("予想区分", PREDICTION_SOURCES, index=1)
             expected_role = st.text_input("位置づけ", placeholder="本線 / 押さえ / 穴 / 見送り検証")
-            note = st.text_area("買い目メモ", height=90)
+            note = st.text_area("買い目理由", height=90)
             submitted = st.form_submit_button("買い目を追加", use_container_width=True)
         if submitted:
             if not combination.strip():
@@ -2395,6 +3986,8 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
                         "stake": int(stake),
                         "payout": int(payout),
                         "expected_role": expected_role.strip(),
+                        "strategy_type": strategy_type,
+                        "prediction_source": prediction_source,
                         "note": note.strip(),
                     },
                 )
@@ -2436,30 +4029,36 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
     st.subheader("登録済み買い目")
     total_stake = int(bets["stake"].sum())
     total_payout = int(bets["payout"].sum())
+    bet_hit_count = int(bets["hit"].sum())
     bet_unit_summary = summary_unit(bets)
     if is_tip_medal(bet_unit_summary):
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("買い目数", f"{len(bets)}")
-        col2.metric("的中率", f"{hit_rate(int(bets['hit'].sum()), len(bets))}%")
-        col3.metric("利用", amount_text(total_stake, bet_unit_summary))
-        col4.metric("残り目安", amount_text(remaining_tip_medals(total_stake), bet_unit_summary))
-        col5.metric(net_label(bet_unit_summary), amount_text(profit(total_stake, total_payout), bet_unit_summary))
+        col2.metric("的中率", hit_rate_metric_text(bet_hit_count, len(bets)), f"{bet_hit_count}/{len(bets)}")
+        col3.metric("利用", metric_amount_text(total_stake, bet_unit_summary))
+        col4.metric("的中払戻", metric_amount_text(total_payout, bet_unit_summary))
+        col5.metric("残り目安", metric_amount_text(remaining_tip_medals(total_stake), bet_unit_summary))
+        col6.metric(net_label(bet_unit_summary), metric_amount_text(profit(total_stake, total_payout), bet_unit_summary))
         st.caption(
-            f"TIPメダルは毎日{TIP_MEDAL_DAILY_GRANT:,}枚付与、{TIP_MEDAL_RESET_TEXT}に失効。"
-            "この画面の差分は現金の損益ではなく、的中率トレーニング用の参考値です。"
+            f"TIPメダルは毎日{compact_tip_medal_text(TIP_MEDAL_DAILY_GRANT)}付与、{TIP_MEDAL_RESET_TEXT}に失効。"
+            "この画面のメダル差分は現金損益ではなく、的中率トレーニング用の参考値です。"
         )
     elif bet_unit_summary == "単位混在":
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("買い目数", f"{len(bets)}")
-        col2.metric("的中率", f"{hit_rate(int(bets['hit'].sum()), len(bets))}%")
-        col3.metric("購入", amount_summary_text(bets, "stake"))
-        col4.metric("差分", profit_summary_text(bets))
+        col2.metric("的中率", hit_rate_metric_text(bet_hit_count, len(bets)), f"{bet_hit_count}/{len(bets)}")
+        col3.metric("購入", amount_summary_text(bets, "stake", compact_tip=True))
+        col4.metric("払戻", amount_summary_text(bets, "payout", compact_tip=True))
+        col5.metric("差分", profit_summary_text(bets, compact_tip=True))
+        st.caption("複数単位が混ざっているため、円収支とメダル差分は明細の単位列で分けて確認します。")
     else:
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("買い目数", f"{len(bets)}")
-        col2.metric("的中率", f"{hit_rate(int(bets['hit'].sum()), len(bets))}%")
-        col3.metric("回収率", f"{recovery_rate(total_stake, total_payout)}%")
-        col4.metric(net_label(bet_unit_summary), amount_text(profit(total_stake, total_payout), bet_unit_summary))
+        col2.metric("的中率", hit_rate_metric_text(bet_hit_count, len(bets)), f"{bet_hit_count}/{len(bets)}")
+        col3.metric("購入", metric_amount_text(total_stake, bet_unit_summary))
+        col4.metric("払戻", metric_amount_text(total_payout, bet_unit_summary))
+        col5.metric(net_label(bet_unit_summary), metric_amount_text(profit(total_stake, total_payout), bet_unit_summary))
+        col6.metric("回収率", f"{recovery_rate(total_stake, total_payout)}%")
 
     bets_view = bets.copy()
     bets_view["名前付き買い目"] = bets_view["combination"].apply(lambda value: format_combination_with_names(value, names))
@@ -2476,6 +4075,8 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
                 "hit",
                 "収支",
                 "expected_role",
+                "strategy_type",
+                "prediction_source",
                 "note",
             ]
         ].rename(
@@ -2489,7 +4090,9 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
                 "hit": "的中",
                 "収支": net_label(bet_unit_summary),
                 "expected_role": "位置づけ",
-                "note": "メモ",
+                "strategy_type": "買い方の型",
+                "prediction_source": "予想区分",
+                "note": "買い目理由",
             }
         ),
         use_container_width=True,
@@ -2517,8 +4120,21 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
         )
         updated_stake = col4.number_input(f"購入（{updated_unit}）", min_value=0, value=int(selected_bet["stake"]), step=100)
         updated_payout = col5.number_input(f"払戻（{updated_unit}）", min_value=0, value=int(selected_bet["payout"]), step=100)
+        col6, col7 = st.columns(2)
+        strategy_value = selected_bet.get("strategy_type", "") if hasattr(selected_bet, "get") else ""
+        source_value = selected_bet.get("prediction_source", "") if hasattr(selected_bet, "get") else ""
+        updated_strategy = col6.selectbox(
+            "買い方の型",
+            STRATEGY_TYPES,
+            index=STRATEGY_TYPES.index(strategy_value) if strategy_value in STRATEGY_TYPES else 0,
+        )
+        updated_source = col7.selectbox(
+            "予想区分",
+            PREDICTION_SOURCES,
+            index=PREDICTION_SOURCES.index(source_value) if source_value in PREDICTION_SOURCES else 0,
+        )
         updated_role = st.text_input("位置づけ", value=selected_bet["expected_role"])
-        updated_note = st.text_area("メモ", value=selected_bet["note"], height=80)
+        updated_note = st.text_area("買い目理由", value=selected_bet["note"], height=80)
         submitted_update = st.form_submit_button("買い目を更新", use_container_width=True)
     if submitted_update:
         update_bet(
@@ -2531,6 +4147,8 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
                 "stake": int(updated_stake),
                 "payout": int(updated_payout),
                 "expected_role": updated_role.strip(),
+                "strategy_type": updated_strategy,
+                "prediction_source": updated_source,
                 "note": updated_note.strip(),
             },
         )
@@ -2553,29 +4171,8 @@ def render_review(selected_race_id: int | None) -> None:
         st.info("買い目を登録すると分析が始まります。")
     else:
         st.markdown("#### 全体成績")
-        total_stake = int(bets["stake"].sum())
-        total_payout = int(bets["payout"].sum())
         unit = summary_unit(bets)
-        col1, col2, col3, col4 = st.columns(4)
-        if is_tip_medal(unit):
-            col1.metric("利用", amount_text(total_stake, unit))
-            col2.metric("的中払戻", amount_text(total_payout, unit))
-            col3.metric("残り目安", amount_text(remaining_tip_medals(total_stake), unit))
-            col4.metric("的中率", f"{hit_rate(int(bets['hit'].sum()), len(bets))}%")
-            st.caption(
-                f"TIPメダルは毎日{TIP_MEDAL_DAILY_GRANT:,}枚付与、{TIP_MEDAL_RESET_TEXT}に失効。"
-                "振り返りでは回収率より、的中率と買い目の絞り込み精度を優先して見ます。"
-            )
-        elif unit == "単位混在":
-            col1.metric("購入", amount_summary_text(bets, "stake"))
-            col2.metric("払戻", amount_summary_text(bets, "payout"))
-            col3.metric("差分", profit_summary_text(bets))
-            col4.metric("的中率", f"{hit_rate(int(bets['hit'].sum()), len(bets))}%")
-        else:
-            col1.metric("購入", amount_text(total_stake, unit))
-            col2.metric("払戻", amount_text(total_payout, unit))
-            col3.metric("回収率", f"{recovery_rate(total_stake, total_payout)}%")
-            col4.metric("的中率", f"{hit_rate(int(bets['hit'].sum()), len(bets))}%")
+        render_bet_performance_summary(bets)
 
         ticket_summary = (
             bets.groupby(["amount_unit", "ticket_type"])
@@ -2584,6 +4181,7 @@ def render_review(selected_race_id: int | None) -> None:
         )
         ticket_summary["差分"] = ticket_summary["払戻"] - ticket_summary["購入"]
         ticket_summary["回収率"] = ticket_summary.apply(lambda row: recovery_rate(row["購入"], row["払戻"]), axis=1)
+        ticket_summary["的中率"] = ticket_summary.apply(lambda row: hit_rate(int(row["的中"]), int(row["件数"])), axis=1)
         st.dataframe(
             ticket_summary.rename(columns={"amount_unit": "単位", "ticket_type": "券種", "差分": net_label(unit)}),
             use_container_width=True,
@@ -2599,7 +4197,7 @@ def render_review(selected_race_id: int | None) -> None:
             continuous_color=True,
             title=f"券種別 {net_label(unit)}",
             x_title=net_label(unit),
-            hover_data=["件数", "的中", "購入", "払戻", "回収率"],
+            hover_data=["件数", "的中", "購入", "払戻", "的中率", "回収率"],
             text_template="%{x:,.0f}",
             color_scale=["#ef4444", "#94a3b8", "#22c55e"],
         )
@@ -2656,18 +4254,22 @@ def main() -> None:
     st.set_page_config(page_title="zenKeirin Lab", page_icon="K", layout="wide")
     apply_style()
     init_db()
+    refresh_public_statuses(date.today().isoformat())
+    today_sync_result = sync_today_winticket_races_once()
     races = fetch_races()
     selected_race_id = sidebar_select_race(races)
     page = st.session_state.get("page", "ダッシュボード")
 
     if page == "ダッシュボード":
-        render_dashboard(races, selected_race_id)
+        render_dashboard(races, selected_race_id, today_sync_result)
     elif page == "競輪場特徴":
         render_venue_features_page(races, selected_race_id)
     elif page == "レース登録":
         render_race_form(selected_race_id)
     elif page == "選手評価":
         render_riders(selected_race_id)
+    elif page == "展開予想":
+        render_development_forecast(selected_race_id)
     elif page == "買い目・結果":
         render_bets_and_results(selected_race_id)
     elif page == "振り返り":

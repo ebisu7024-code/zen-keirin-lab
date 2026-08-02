@@ -1,7 +1,14 @@
 import unittest
 from urllib.error import HTTPError
 
-from winticket_source import extract_source_race_id, parse_winticket_racecard_html, parse_winticket_result_html, resolve_race_urls
+from winticket_source import (
+    extract_source_race_id,
+    parse_winticket_race_metadata,
+    parse_winticket_racecard_html,
+    parse_winticket_racecard_index_html,
+    parse_winticket_result_html,
+    resolve_race_urls,
+)
 
 
 RACECARD_FIXTURE = """
@@ -122,6 +129,34 @@ RESULT_FIXTURE = """
 """
 
 
+RACECARD_INDEX_FIXTURE = """
+<h1>2026年7月26日 競輪出走表</h1>
+<h2>2026年7月26日 出走表一覧</h2>
+<a href="/keirin/wakayama">和歌山競輪</a>
+<p>7月24日 〜 7月26日</p>
+<p>ＲＣケイリン賞パチ７カップ</p>
+<a href="/keirin/wakayama/racecard/2026072455/3/1">1R</a>
+<a href="/keirin/wakayama/racecard/2026072455/3/2">2R A級チ一般</a>
+<a href="/keirin/kokura">小倉競輪</a>
+<p>7月24日 〜 7月26日</p>
+<p>門司港地ビール杯×こがね市場杯</p>
+<a href="/keirin/kokura/racecard/2026072481/3/11">11R</a>
+"""
+
+
+RACECARD_INDEX_SPLIT_VENUE_FIXTURE = """
+<h1>2026年7月26日 競輪出走表</h1>
+<h2>出走表一覧</h2>
+<a href="/keirin/wakayama/racecard">和歌山<span>競輪</span></a>
+<span>F2</span>
+<span>ガールズ</span>
+<span>7月24日</span><span>〜</span><span>7月26日</span>
+<span>ＲＣケイリン賞パチ７カップ</span>
+<a href="/keirin/wakayama/racecard/2026072455/3/1">1R</a>
+<a href="/keirin/wakayama/racecard/2026072455/3/11">11R</a>
+"""
+
+
 class WinticketSourceTest(unittest.TestCase):
     def test_parse_racecard_riders_and_lines(self):
         line_summary, riders = parse_winticket_racecard_html(RACECARD_FIXTURE)
@@ -177,6 +212,41 @@ class WinticketSourceTest(unittest.TestCase):
             extract_source_race_id("https://www.winticket.jp/keirin/sasebo/raceresult/2026072285/2/12"),
             "2026-07-23_85_12",
         )
+
+    def test_parse_racecard_index_listings(self):
+        listings = parse_winticket_racecard_index_html(RACECARD_INDEX_FIXTURE, "2026-07-26")
+        self.assertEqual(len(listings), 3)
+        self.assertEqual(listings[0].venue, "和歌山")
+        self.assertEqual(listings[0].race_title, "ＲＣケイリン賞パチ７カップ")
+        self.assertEqual(listings[0].race_no, 1)
+        self.assertEqual(listings[0].source_race_id, "2026-07-26_55_01")
+        self.assertEqual(listings[1].grade, "A級チ一般")
+        self.assertEqual(listings[2].venue, "小倉")
+        self.assertEqual(listings[2].source_race_id, "2026-07-26_81_11")
+
+    def test_parse_racecard_index_split_venue_tokens(self):
+        listings = parse_winticket_racecard_index_html(RACECARD_INDEX_SPLIT_VENUE_FIXTURE, "2026-07-26")
+        self.assertEqual(len(listings), 2)
+        self.assertEqual(listings[0].venue, "和歌山")
+        self.assertEqual(listings[0].race_title, "ＲＣケイリン賞パチ７カップ")
+        self.assertEqual(listings[0].grade, "F2")
+        self.assertEqual(listings[1].source_race_id, "2026-07-26_55_11")
+
+    def test_parse_race_metadata(self):
+        metadata = parse_winticket_race_metadata(
+            """
+            ＲＣケイリン賞パチ７カップ
+            A級チ一般
+            発走 10:59 締切 10:54
+            2026年7月26日 1,625m (4周) 曇34.0℃北北西1.0m/s
+            """
+        )
+        self.assertEqual(metadata["grade"], "A級チ一般")
+        self.assertEqual(metadata["distance"], 1625)
+        self.assertEqual(metadata["weather"], "曇")
+        self.assertEqual(metadata["wind"], 1.0)
+        self.assertEqual(metadata["start_time"], "10:59")
+        self.assertEqual(metadata["close_time"], "10:54")
 
 
 if __name__ == "__main__":

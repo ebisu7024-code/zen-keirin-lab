@@ -55,6 +55,10 @@ class KeirinLogicTest(unittest.TestCase):
         self.assertEqual(line_function_status((3, 4), normalize_result(6, 3, 1)), "半機能")
         self.assertEqual(line_function_status((8,), normalize_result(6, 3, 1)), "単騎")
 
+    def test_line_summary_accepts_keirin_shorthand(self):
+        self.assertEqual(parse_line_summary("123ー456ー789"), ((1, 2, 3), (4, 5, 6), (7, 8, 9)))
+        self.assertEqual(parse_line_summary("← 3－4－2 ・ 1－5"), ((3, 4, 2), (1, 5)))
+
     def test_format_combination_with_names(self):
         names = {6: "谷本奨輝", 2: "岡崎祥伍"}
         self.assertEqual(format_combination_with_names("6-2-3", names), "6 谷本奨輝 - 2 岡崎祥伍 - 3")

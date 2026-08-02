@@ -22,13 +22,32 @@ def parse_numbers(value: str | None) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", str(value)))
 
 
+def parse_line_group(value: str | None) -> tuple[int, ...]:
+    """1つのライン表記を車番タプルにする。"""
+    if not value:
+        return ()
+    text = str(value).strip()
+    if re.fullmatch(r"\d{2,}", text):
+        return tuple(int(char) for char in text)
+    return parse_numbers(text)
+
+
 def parse_line_summary(value: str | None) -> tuple[tuple[int, ...], ...]:
     """並び予想文字列をライン単位の車番タプルにする。"""
     if not value:
         return ()
+    text = str(value).strip().replace("←", "").replace("→", "")
+    parts = [
+        part.strip()
+        for part in re.split(r"\s*/\s*|／|・|･|\s+区切り\s+", text)
+        if part.strip()
+    ]
+    if len(parts) == 1 and re.fullmatch(r"\d{2,}(?:\s*[-ー－−—–]\s*\d{2,})+", parts[0]):
+        parts = [part.strip() for part in re.split(r"\s*[-ー－−—–]\s*", parts[0]) if part.strip()]
+
     groups: list[tuple[int, ...]] = []
-    for group_text in re.split(r"\s*/\s*|\s+区切り\s+", str(value).strip()):
-        numbers = parse_numbers(group_text)
+    for group_text in parts:
+        numbers = parse_line_group(group_text)
         if numbers:
             groups.append(numbers)
     return tuple(groups)

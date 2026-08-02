@@ -114,6 +114,20 @@ class WinticketPayout:
 
 
 @dataclass(frozen=True)
+class WinticketRaceListing:
+    race_date: str
+    venue: str
+    race_no: int
+    race_title: str = ""
+    grade: str = ""
+    start_time: str = ""
+    close_time: str = ""
+    source_status: str = "本日開催"
+    source_race_id: str = ""
+    racecard_url: str = ""
+
+
+@dataclass(frozen=True)
 class WinticketRaceSource:
     source_race_id: str
     racecard_url: str
@@ -122,6 +136,18 @@ class WinticketRaceSource:
     riders: tuple[WinticketRider, ...]
     result_rows: tuple[WinticketResultRow, ...]
     payouts: tuple[WinticketPayout, ...]
+    grade: str = ""
+    distance: int = 0
+    weather: str = ""
+    wind: float = 0.0
+    start_time: str = ""
+    close_time: str = ""
+
+
+@dataclass(frozen=True)
+class _TextToken:
+    text: str
+    href: str = ""
 
 
 class _TextParser(HTMLParser):
@@ -135,6 +161,32 @@ class _TextParser(HTMLParser):
             self.lines.append(text)
 
 
+class _LinkedTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tokens: list[_TextToken] = []
+        self.href_stack: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        href = ""
+        for name, value in attrs:
+            if name == "href" and value:
+                href = value
+                break
+        self.href_stack.append(href)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.href_stack:
+            self.href_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        text = clean_text(data)
+        if text:
+            self.tokens.append(_TextToken(text=text, href=self.href_stack[-1] if self.href_stack else ""))
+
+
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("\u3000", " ")).strip()
 
@@ -145,6 +197,12 @@ def html_to_lines(source: str) -> list[str]:
     parser = _TextParser()
     parser.feed(source)
     return [line for line in parser.lines if line]
+
+
+def html_to_linked_tokens(source: str) -> list[_TextToken]:
+    parser = _LinkedTextParser()
+    parser.feed(source)
+    return [token for token in parser.tokens if token.text]
 
 
 def extract_source_race_id(text: str | None) -> str:
@@ -160,6 +218,111 @@ def extract_source_race_id(text: str | None) -> str:
     race_date = event_date + timedelta(days=int(winticket_match.group("day_index")) - 1)
     race_no = int(winticket_match.group("race_no"))
     return f"{race_date:%Y-%m-%d}_{winticket_match.group('venue_code')}_{race_no:02d}"
+
+
+def _normalize_venue_name(value: str) -> str:
+    return clean_text(value).removesuffix("競輪")
+
+
+def _is_date_range_text(value: str) -> bool:
+    return bool(re.search(r"[0-9]+月[0-9]+日\s*〜\s*[0-9]+月[0-9]+日", value))
+
+
+def _is_schedule_token(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9]+月[0-9]+日|〜", value) or _is_date_range_text(value))
+
+
+def _is_grade_token(value: str) -> bool:
+    return bool(re.fullmatch(r"[FG][0-9]|G[1-6]", value))
+
+
+def _is_event_kind_token(value: str) -> bool:
+    return value in {"デイ", "ナイター", "ミッドナイト", "モーニング", "ガールズ"}
+
+
+def _is_venue_racecard_href(value: str) -> bool:
+    return bool(re.fullmatch(r"https://www\.winticket\.jp/keirin/[^/]+/racecard|/keirin/[^/]+/racecard", value))
+
+
+def _listing_race_date(source_race_id: str, fallback: str) -> str:
+    if source_race_id:
+        return source_race_id.split("_", 1)[0]
+    return fallback
+
+
+def parse_winticket_racecard_index_html(source: str, race_date: str) -> tuple[WinticketRaceListing, ...]:
+    tokens = html_to_linked_tokens(source)
+    listings: list[WinticketRaceListing] = []
+    seen: set[str] = set()
+    in_list = False
+    venue = ""
+    race_title = ""
+    grade = ""
+    title_candidate = ""
+
+    for token in tokens:
+        text = token.text
+        href = token.href
+        if "出走表一覧" in text:
+            in_list = True
+            continue
+        if not in_list:
+            continue
+
+        if href and (
+            (text.endswith("競輪") and text != "競輪" and "/keirin/" in href and not _is_venue_racecard_href(href))
+            or (_is_venue_racecard_href(href) and text != "競輪")
+        ):
+            venue = _normalize_venue_name(text)
+            race_title = ""
+            grade = ""
+            title_candidate = ""
+            continue
+
+        if not venue:
+            continue
+
+        race_match = re.match(r"^(?P<race_no>[0-9]{1,2})[RＲ](?:\s+(?P<grade>.+))?$", text)
+        if href and "/racecard/" in href and race_match:
+            racecard_url = urljoin(BASE_URL, href.split("?")[0])
+            source_race_id = extract_source_race_id(racecard_url)
+            dedupe_key = source_race_id or racecard_url
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            listings.append(
+                WinticketRaceListing(
+                    race_date=_listing_race_date(source_race_id, race_date),
+                    venue=venue,
+                    race_no=int(race_match.group("race_no")),
+                    race_title=race_title,
+                    grade=(race_match.group("grade") or grade).strip(),
+                    source_race_id=source_race_id,
+                    racecard_url=racecard_url,
+                )
+            )
+            continue
+
+        if href or text in {"Select", "前日翌日", "競輪"}:
+            continue
+        if text in {"WINTICKET", "競輪"}:
+            continue
+        if _is_grade_token(text):
+            grade = text
+            continue
+        if _is_schedule_token(text) or _is_event_kind_token(text):
+            continue
+        title_candidate = text
+        race_title = title_candidate
+
+
+    return tuple(listings)
+
+
+def fetch_winticket_race_listings(race_date: str, fetcher=None) -> tuple[WinticketRaceListing, ...]:
+    fetcher = fetcher or fetch_url
+    url = f"{BASE_URL}/keirin/racecard/{compact_date(race_date)}"
+    return parse_winticket_racecard_index_html(fetcher(url), race_date)
 
 
 def fetch_url(url: str, timeout: int = 20) -> str:
@@ -429,6 +592,39 @@ def parse_winticket_racecard_html(source: str) -> tuple[str, tuple[WinticketRide
     return line_summary, tuple(sorted(riders, key=lambda rider: rider.car_no))
 
 
+def parse_winticket_race_metadata(source: str) -> dict:
+    lines = html_to_lines(source)
+    metadata = {
+        "grade": "",
+        "distance": 0,
+        "weather": "",
+        "wind": 0.0,
+        "start_time": "",
+        "close_time": "",
+    }
+    for line in lines[:80]:
+        time_match = re.search(r"発走\s*([0-9]{1,2}:[0-9]{2})\s*締切\s*([0-9]{1,2}:[0-9]{2})", line)
+        if time_match:
+            metadata["start_time"] = time_match.group(1)
+            metadata["close_time"] = time_match.group(2)
+
+        if not metadata["grade"] and "級" in line and len(line) <= 24 and "競輪" not in line:
+            metadata["grade"] = line
+
+        distance_match = re.search(r"([0-9,]+)m", line)
+        if distance_match and not metadata["distance"]:
+            metadata["distance"] = int(distance_match.group(1).replace(",", ""))
+
+        weather_match = re.search(r"\)\s*([^\d\s]+)[0-9.]+℃", line)
+        if weather_match and not metadata["weather"]:
+            metadata["weather"] = weather_match.group(1)
+
+        wind_match = re.search(r"([0-9]+(?:\.[0-9]+)?)m/s", line)
+        if wind_match and not metadata["wind"]:
+            metadata["wind"] = float(wind_match.group(1))
+    return metadata
+
+
 def _parse_result_detail(line: str) -> tuple[str, str, str, str]:
     parts = line.split()
     agari_index = -1
@@ -584,9 +780,20 @@ def fetch_winticket_race(
     fetcher=fetch_url,
 ) -> WinticketRaceSource:
     racecard_url, result_url = resolve_race_urls(race_date, race_no, source_race_id, venue, race_title, fetcher=fetcher)
+    return fetch_winticket_race_by_urls(source_race_id, racecard_url, result_url, fetcher=fetcher)
+
+
+def fetch_winticket_race_by_urls(
+    source_race_id: str,
+    racecard_url: str,
+    result_url: str = "",
+    fetcher=fetch_url,
+) -> WinticketRaceSource:
+    result_url = result_url or racecard_url.replace("/racecard/", "/raceresult/")
     racecard_html = fetcher(racecard_url)
     result_html = fetcher(result_url)
     card_line_summary, riders = parse_winticket_racecard_html(racecard_html)
+    metadata = parse_winticket_race_metadata(racecard_html)
     result_line_summary, result_rows, payouts = parse_winticket_result_html(result_html)
     return WinticketRaceSource(
         source_race_id=source_race_id,
@@ -596,4 +803,10 @@ def fetch_winticket_race(
         riders=riders,
         result_rows=result_rows,
         payouts=payouts,
+        grade=str(metadata["grade"]),
+        distance=int(metadata["distance"] or 0),
+        weather=str(metadata["weather"]),
+        wind=float(metadata["wind"] or 0.0),
+        start_time=str(metadata["start_time"]),
+        close_time=str(metadata["close_time"]),
     )

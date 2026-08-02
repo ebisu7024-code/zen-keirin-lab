@@ -22,6 +22,32 @@ class AppCompletionTest(unittest.TestCase):
         app.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
 
+    def test_amount_labels_separate_yen_and_tip_medals(self):
+        self.assertEqual(app.net_label("円"), "円収支")
+        self.assertEqual(app.net_label("TIPメダル"), "メダル差分")
+        self.assertEqual(app.amount_text(12300, "TIPメダル"), "12,300 TIPメダル")
+        self.assertEqual(app.amount_text(12300, "TIPメダル", compact_tip=True), "1.2万枚")
+        self.assertEqual(app.amount_text(-25000, "TIPメダル", compact_tip=True), "-2.5万枚")
+
+    def test_build_bet_unit_summary_keeps_yen_and_tip_medals_separate(self):
+        bets = pd.DataFrame(
+            [
+                {"amount_unit": "円", "stake": 100, "payout": 250, "hit": 1},
+                {"amount_unit": "円", "stake": 100, "payout": 0, "hit": 0},
+                {"amount_unit": "TIPメダル", "stake": 10000, "payout": 0, "hit": 0},
+            ]
+        )
+
+        summary = app.build_bet_unit_summary(bets)
+
+        self.assertEqual(summary["amount_unit"].tolist(), ["円", "TIPメダル"])
+        yen = summary[summary["amount_unit"] == "円"].iloc[0]
+        medals = summary[summary["amount_unit"] == "TIPメダル"].iloc[0]
+        self.assertEqual(int(yen["差分"]), 50)
+        self.assertEqual(float(yen["的中率"]), 50.0)
+        self.assertEqual(int(medals["差分"]), -10000)
+        self.assertEqual(float(medals["的中率"]), 0.0)
+
     def test_upsert_race_materializes_manual_line_summary(self):
         race_id = app.upsert_race(
             None,
@@ -49,15 +75,317 @@ class AppCompletionTest(unittest.TestCase):
     def test_winticket_candidates_include_missing_riders_or_lines(self):
         races = pd.DataFrame(
             [
-                {"id": 1, "race_date": "2026-07-23", "source_race_id": "2026-07-23_36_01", "rider_count": 0, "line_count": 0},
-                {"id": 2, "race_date": "2026-07-23", "source_race_id": "2026-07-23_36_02", "rider_count": 7, "line_count": 0},
-                {"id": 3, "race_date": "2026-07-23", "source_race_id": "2026-07-23_36_03", "rider_count": 7, "line_count": 3},
-                {"id": 4, "race_date": "2026-07-23", "source_race_id": "", "rider_count": 0, "line_count": 0},
+                {
+                    "id": 1,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "2026-07-23_36_01",
+                    "rider_count": 0,
+                    "line_count": 0,
+                    "result_row_count": 7,
+                    "payout_count": 8,
+                },
+                {
+                    "id": 2,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "2026-07-23_36_02",
+                    "rider_count": 7,
+                    "line_count": 0,
+                    "result_row_count": 7,
+                    "payout_count": 8,
+                },
+                {
+                    "id": 3,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "2026-07-23_36_03",
+                    "rider_count": 7,
+                    "line_count": 3,
+                    "result_row_count": 7,
+                    "payout_count": 8,
+                },
+                {
+                    "id": 4,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "",
+                    "rider_count": 0,
+                    "line_count": 0,
+                    "result_row_count": 0,
+                    "payout_count": 0,
+                },
             ]
         )
 
         candidates = app.winticket_sync_candidates(races, limit=10)
         self.assertEqual(candidates["id"].tolist(), [2, 1])
+
+    def test_winticket_candidates_include_missing_results_or_payouts(self):
+        races = pd.DataFrame(
+            [
+                {
+                    "id": 1,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "2026-07-23_36_01",
+                    "rider_count": 7,
+                    "line_count": 3,
+                    "result_row_count": 0,
+                    "payout_count": 8,
+                },
+                {
+                    "id": 2,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "2026-07-23_36_02",
+                    "rider_count": 7,
+                    "line_count": 3,
+                    "result_row_count": 7,
+                    "payout_count": 0,
+                },
+                {
+                    "id": 3,
+                    "race_date": "2026-07-23",
+                    "source_race_id": "2026-07-23_36_03",
+                    "rider_count": 7,
+                    "line_count": 3,
+                    "result_row_count": 7,
+                    "payout_count": 8,
+                },
+            ]
+        )
+
+        candidates = app.winticket_sync_candidates(races, limit=10)
+        self.assertEqual(candidates["id"].tolist(), [2, 1])
+
+    def test_sync_winticket_race_list_keeps_existing_race_data(self):
+        racecard_url = "https://www.winticket.jp/keirin/wakayama/racecard/2026072455/3/1"
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-26",
+                "venue": "和歌山",
+                "race_no": 1,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "円",
+                "status": "予想中",
+                "race_title": "",
+                "source_ref": racecard_url,
+                "line_summary": "",
+                "race_memo": "自分の予想前メモは残す",
+            },
+        )
+        app.add_bet(
+            race_id,
+            {
+                "ticket_type": "3連単",
+                "combination": "1-2-3",
+                "amount_unit": "円",
+                "stake": 100,
+                "payout": 0,
+                "expected_role": "本線",
+                "strategy_type": "1〜3着候補",
+                "prediction_source": "自分予想",
+                "note": "既存の買い目理由",
+            },
+        )
+
+        def fake_fetcher(url):
+            self.assertEqual(url, "https://www.winticket.jp/keirin/racecard/20260726")
+            return """
+            <h2>2026年7月26日 出走表一覧</h2>
+            <a href="/keirin/wakayama">和歌山競輪</a>
+            <p>7月24日 〜 7月26日</p>
+            <p>ＲＣケイリン賞パチ７カップ</p>
+            <a href="/keirin/wakayama/racecard/2026072455/3/1">1R</a>
+            """
+
+        result = app.sync_winticket_race_list_for_date("2026-07-26", fetcher=fake_fetcher)
+        self.assertEqual(result["fetched"], 1)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["updated"], 1)
+
+        races = app.fetch_races()
+        self.assertEqual(len(races), 1)
+        saved = app.fetch_race(race_id)
+        self.assertEqual(saved["race_memo"], "自分の予想前メモは残す")
+        self.assertEqual(saved["race_title"], "ＲＣケイリン賞パチ７カップ")
+        self.assertEqual(saved["status"], "開催前")
+        self.assertEqual(saved["source_status"], "本日開催")
+        self.assertEqual(len(app.fetch_bets(race_id)), 1)
+
+    def test_sync_winticket_race_list_keeps_tipstar_result_status(self):
+        racecard_url = "https://www.winticket.jp/keirin/toride/racecard/2026072623/1/3"
+        tipstar_url = "https://tipstar.com/order/result?raceType=keirin&raceId=2026-07-26_23_03"
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-26",
+                "venue": "取手",
+                "race_no": 3,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "円",
+                "status": "結果入力済み",
+                "race_title": "",
+                "source_ref": racecard_url,
+                "line_summary": "",
+                "race_memo": "",
+            },
+        )
+        with app.get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE races
+                SET source_status = 'TIPSTAR取込',
+                    source_result_url = ?
+                WHERE id = ?
+                """,
+                (tipstar_url, race_id),
+            )
+
+        def fake_fetcher(url):
+            self.assertEqual(url, "https://www.winticket.jp/keirin/racecard/20260726")
+            return """
+            <h2>2026年7月26日 出走表一覧</h2>
+            <a href="/keirin/toride">取手競輪</a>
+            <p>7月26日 〜 7月26日</p>
+            <p>Ｆ２</p>
+            <a href="/keirin/toride/racecard/2026072623/1/3">3R</a>
+            """
+
+        result = app.sync_winticket_race_list_for_date("2026-07-26", fetcher=fake_fetcher)
+        self.assertEqual(result["fetched"], 1)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["updated"], 1)
+
+        saved = app.fetch_race(race_id)
+        self.assertEqual(saved["status"], "結果入力済み")
+        self.assertEqual(saved["source_status"], "TIPSTAR取込")
+        self.assertEqual(saved["source_result_url"], tipstar_url)
+
+    def test_sync_winticket_race_list_can_hydrate_details_and_mark_finished(self):
+        racecard_url = "https://www.winticket.jp/keirin/wakayama/racecard/2026072455/3/1"
+        result_url = racecard_url.replace("/racecard/", "/raceresult/")
+
+        def fake_fetcher(url):
+            if url == "https://www.winticket.jp/keirin/racecard/20260726":
+                return """
+                <h2>出走表一覧</h2>
+                <a href="/keirin/wakayama/racecard">和歌山<span>競輪</span></a>
+                <span>F2</span>
+                <span>7月24日</span><span>〜</span><span>7月26日</span>
+                <span>ＲＣケイリン賞パチ７カップ</span>
+                <a href="/keirin/wakayama/racecard/2026072455/3/1">1R</a>
+                """
+            if url == racecard_url:
+                return """
+                A級チ一般
+                発走 10:59 締切 10:54
+                2026年7月26日 1,625m (4周) 曇34.0℃北北西1.0m/s
+                枠 車
+                選手名
+                1
+                1
+                山田太郎 東京 A1 30歳 100期
+                80.00
+                3.92 自力。
+                2
+                2
+                佐藤次郎 神奈川 A1 31歳 101期
+                79.00
+                3.92 山田君。
+                並び予想
+                1
+                2
+                結果
+                """
+            if url == result_url:
+                return """
+                並び予想
+                1
+                2
+                着順 ビデオ 映像を観る
+                着 車 選手名 着差 上り 決 SB
+                1
+                1
+                山田太郎 東京 A1 30歳 100期
+                11.6 逃 B
+                2
+                2
+                佐藤次郎 神奈川 A1 31歳 101期
+                1車輪 11.5
+                払戻金
+                賭け式 払戻金 人気
+                2車単 1-2 300 円(1)
+                """
+            raise AssertionError(f"unexpected url: {url}")
+
+        result = app.sync_winticket_race_list_for_date("2026-07-26", fetcher=fake_fetcher, hydrate=True, hydrate_limit=10)
+        self.assertEqual(result["fetched"], 1)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(len(result["details"]["synced"]), 1)
+
+        races = app.fetch_races()
+        race_id = int(races.iloc[0]["id"])
+        saved = app.fetch_race(race_id)
+        self.assertEqual(saved["status"], "終了")
+        self.assertEqual(saved["source_status"], "補完済み")
+        self.assertEqual(len(app.fetch_riders(race_id)), 2)
+        self.assertEqual(len(app.fetch_lines(race_id)), 1)
+        self.assertEqual(len(app.fetch_result_rows(race_id)), 2)
+
+    def test_input_queues_split_missing_work(self):
+        races = pd.DataFrame(
+            [
+                {
+                    "id": 1,
+                    "race_date": "2026-07-24",
+                    "source_synced_at": "2026-07-24T09:00:00",
+                    "venue": "小倉",
+                    "race_no": 1,
+                    "start_time": "",
+                    "close_time": "",
+                    "race_title": "買い目なし",
+                    "status": "予想中",
+                    "bet_count": 0,
+                    "missing_bet_reason_count": 0,
+                    "review_done": 0,
+                },
+                {
+                    "id": 2,
+                    "race_date": "2026-07-26",
+                    "source_synced_at": "2026-07-26T09:00:00",
+                    "venue": "和歌山",
+                    "race_no": 2,
+                    "start_time": "",
+                    "close_time": "",
+                    "race_title": "理由なし",
+                    "status": "購入済み",
+                    "bet_count": 2,
+                    "missing_bet_reason_count": 1,
+                    "review_done": 0,
+                },
+                {
+                    "id": 3,
+                    "race_date": "2026-07-26",
+                    "source_synced_at": "2026-07-26T08:00:00",
+                    "venue": "取手",
+                    "race_no": 1,
+                    "start_time": "",
+                    "close_time": "",
+                    "race_title": "完了",
+                    "status": "振り返り済み",
+                    "bet_count": 1,
+                    "missing_bet_reason_count": 0,
+                    "review_done": 1,
+                },
+            ]
+        )
+
+        self.assertEqual(app.build_unbet_race_queue(races)["race_id"].tolist(), [1])
+        self.assertEqual(app.build_missing_bet_reason_queue(races)["race_id"].tolist(), [2])
+        self.assertEqual(app.build_unreviewed_race_queue(races)["race_id"].tolist(), [2, 1])
 
     def test_result_rows_allow_same_finish_order_for_dead_heat(self):
         race_id = app.upsert_race(
@@ -94,6 +422,148 @@ class AppCompletionTest(unittest.TestCase):
         rows = app.fetch_result_rows(race_id)
         self.assertEqual(rows["finish_order"].tolist(), [1, 2, 3, 3])
         self.assertEqual(rows["car_no"].tolist(), [5, 1, 6, 7])
+
+    def test_virtual_bank_projection_moves_lines(self):
+        groups = ((1, 2, 3), (4, 5, 6), (7, 8, 9))
+
+        moved = app.move_line_group(groups, 2, 0)
+
+        self.assertEqual(moved, ((7, 8, 9), (1, 2, 3), (4, 5, 6)))
+        self.assertEqual(app.project_development_top3(moved, 0, "ライン順走"), (7, 8, 9))
+        self.assertEqual(app.project_development_top3(moved, 0, "番手差し"), (8, 7, 9))
+        self.assertEqual(app.project_development_top3(moved, 0, "競り・分断"), (7, 1, 4))
+
+    def test_virtual_bank_html_is_not_indented_as_markdown_code(self):
+        html = app.virtual_bank_html(
+            ((1, 2), (3, 4)),
+            0,
+            (1, 2, 3),
+            {1: "山崎賢人", 2: "小川勇介"},
+        )
+
+        self.assertTrue(html.startswith('<div class="virtual-bank">'))
+        self.assertIn('class="rider-chip is-active is-projected"', html)
+        self.assertNotIn("\n    <div", html)
+
+    def test_prerace_reference_builds_line_and_scenario_candidates(self):
+        riders = pd.DataFrame(
+            [
+                {"car_no": 1, "rider_name": "山崎賢人", "racing_score": 108.0, "総合": 72.0, "final_mark": "◎"},
+                {"car_no": 2, "rider_name": "小川勇介", "racing_score": 104.0, "総合": 68.0, "final_mark": "○"},
+                {"car_no": 3, "rider_name": "山岸佳太", "racing_score": 101.0, "総合": 60.0, "final_mark": ""},
+                {"car_no": 4, "rider_name": "恩田淳平", "racing_score": 99.0, "総合": 58.0, "final_mark": ""},
+            ]
+        )
+        history = pd.DataFrame(
+            [
+                {
+                    "line_size": 2,
+                    "venue": "佐世保",
+                    "grade": "F1",
+                    "line_function": 1,
+                    "line_exact_top2": 1,
+                    "leader_first": 1,
+                    "second_first": 0,
+                    "line_collapse": 0,
+                },
+                {
+                    "line_size": 2,
+                    "venue": "別府",
+                    "grade": "F1",
+                    "line_function": 0,
+                    "line_exact_top2": 0,
+                    "leader_first": 0,
+                    "second_first": 1,
+                    "line_collapse": 1,
+                },
+            ]
+        )
+        race = {"venue": "佐世保", "grade": "F1", "race_no": 12}
+        names = {1: "山崎賢人", 2: "小川勇介", 3: "山岸佳太", 4: "恩田淳平"}
+
+        line_reference = app.build_prerace_line_reference(((1, 2), (3, 4)), riders, race, history, names)
+        candidates = app.build_prerace_scenario_candidates(((1, 2), (3, 4)), riders, race, history, names)
+        note = app.prerace_note_text(race, line_reference, candidates)
+
+        self.assertEqual(line_reference["ライン"].tolist(), ["ライン1", "ライン2"])
+        self.assertGreater(float(line_reference.iloc[0]["参考指数"]), float(line_reference.iloc[1]["参考指数"]))
+        self.assertIn("崩れ", line_reference.iloc[0]["見るポイント"])
+        self.assertFalse(candidates.empty)
+        self.assertIn("1 山崎賢人", candidates.iloc[0]["想定上位"])
+        self.assertIn("開催前メモ", note)
+
+    def test_development_probability_summary_uses_past_result_rows(self):
+        first_race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-23",
+                "venue": "小倉",
+                "race_no": 1,
+                "grade": "F2",
+                "distance": 1625,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "円",
+                "status": "結果入力済み",
+                "race_title": "展開テスト1",
+                "source_ref": "",
+                "line_summary": "1-2-3 / 4-5",
+                "race_memo": "",
+            },
+        )
+        second_race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-24",
+                "venue": "別府",
+                "race_no": 2,
+                "grade": "F2",
+                "distance": 1625,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "円",
+                "status": "結果入力済み",
+                "race_title": "展開テスト2",
+                "source_ref": "",
+                "line_summary": "6-7-8 / 1-2",
+                "race_memo": "",
+            },
+        )
+        with app.get_conn() as conn:
+            app.save_result_rows(
+                conn,
+                first_race_id,
+                (
+                    WinticketResultRow(1, 1, "一番"),
+                    WinticketResultRow(2, 2, "二番"),
+                    WinticketResultRow(3, 4, "四番"),
+                ),
+            )
+            app.save_result_rows(
+                conn,
+                second_race_id,
+                (
+                    WinticketResultRow(1, 7, "七番"),
+                    WinticketResultRow(2, 6, "六番"),
+                    WinticketResultRow(3, 8, "八番"),
+                ),
+            )
+
+        history = app.fetch_development_history()
+        three_car_history = history[history["line_size"] == 3]
+        self.assertEqual(len(three_car_history), 2)
+
+        summary, focus, scope = app.build_development_probability_summary(
+            history,
+            (1, 2, 3),
+            app.fetch_race(first_race_id),
+            "番手差し",
+        )
+
+        self.assertEqual(scope, "3車ライン全体")
+        self.assertEqual(focus["項目"], "番手1着")
+        self.assertEqual(float(focus["確率"]), 50.0)
+        self.assertIn("ライン機能", summary["項目"].tolist())
 
 
 if __name__ == "__main__":
