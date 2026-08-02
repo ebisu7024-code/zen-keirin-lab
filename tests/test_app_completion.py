@@ -48,6 +48,55 @@ class AppCompletionTest(unittest.TestCase):
         self.assertEqual(int(medals["差分"]), -10000)
         self.assertEqual(float(medals["的中率"]), 0.0)
 
+    def test_adjustment_race_is_hidden_from_race_list_but_kept_in_bets(self):
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-08-02",
+                "venue": "TIPSTAR年次調整",
+                "race_no": 0,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "円",
+                "status": "結果入力済み",
+                "race_title": "TIPSTARプロフィール年次合計調整",
+                "source_ref": "",
+                "line_summary": "",
+                "race_memo": "",
+            },
+        )
+        with app.get_conn() as conn:
+            conn.execute(
+                "UPDATE races SET source_status = 'TIPSTAR年次差額調整' WHERE id = ?",
+                (race_id,),
+            )
+        app.add_bet(
+            race_id,
+            {
+                "ticket_type": "調整",
+                "combination": "TIPSTAR年次合計",
+                "amount_unit": "円",
+                "stake": 42200,
+                "payout": 57690,
+                "expected_role": "",
+                "strategy_type": "年次差額調整",
+                "prediction_source": "記録のみ",
+                "note": "プロフィール合計との差額調整",
+            },
+        )
+
+        self.assertTrue(app.fetch_races().empty)
+        bets = app.fetch_all_bets()
+        self.assertEqual(len(bets), 1)
+        self.assertEqual(int(bets.iloc[0]["stake"]), 42200)
+        self.assertEqual(app.exclude_adjustment_bets(bets).empty, True)
+        summary = app.build_bet_unit_summary(bets)
+        self.assertEqual(int(summary.iloc[0]["購入"]), 42200)
+        self.assertEqual(int(summary.iloc[0]["払戻"]), 57690)
+        self.assertEqual(int(summary.iloc[0]["買い目数"]), 0)
+
     def test_upsert_race_materializes_manual_line_summary(self):
         race_id = app.upsert_race(
             None,

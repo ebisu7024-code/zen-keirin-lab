@@ -85,6 +85,7 @@ BANK_LINE_COLORS = ["#38bdf8", "#22c55e", "#f59e0b", "#f43f5e", "#a78bfa", "#14b
 TIP_MEDAL_DAILY_GRANT = 10000
 TIP_MEDAL_RESET_TEXT = "翌日3:00"
 TODAY_SYNC_VERSION = "racecard-index-v4"
+ADJUSTMENT_SOURCE_STATUSES = {"TIPSTAR年次差額調整"}
 
 
 def now_text() -> str:
@@ -425,11 +426,23 @@ def build_bet_unit_summary(bets: pd.DataFrame) -> pd.DataFrame:
     work["amount_unit"] = work["amount_unit"].fillna("円").replace("", "円")
     if "収支" not in work.columns:
         work["収支"] = work.apply(lambda row: profit(row["stake"], row["payout"]), axis=1)
-    summary = (
+    financial_summary = (
         work.groupby("amount_unit", dropna=False)
-        .agg(買い目数=("hit", "count"), 的中=("hit", "sum"), 購入=("stake", "sum"), 払戻=("payout", "sum"), 差分=("収支", "sum"))
+        .agg(購入=("stake", "sum"), 払戻=("payout", "sum"), 差分=("収支", "sum"))
         .reset_index()
     )
+
+    hit_work = exclude_adjustment_bets(work)
+    if hit_work.empty:
+        hit_summary = pd.DataFrame(columns=["amount_unit", "買い目数", "的中"])
+    else:
+        hit_summary = (
+            hit_work.groupby("amount_unit", dropna=False)
+            .agg(買い目数=("hit", "count"), 的中=("hit", "sum"))
+            .reset_index()
+        )
+    summary = financial_summary.merge(hit_summary, on="amount_unit", how="left")
+    summary[["買い目数", "的中"]] = summary[["買い目数", "的中"]].fillna(0).astype(int)
     summary["的中率"] = summary.apply(lambda row: hit_rate(int(row["的中"]), int(row["買い目数"])), axis=1)
     summary["回収率"] = summary.apply(lambda row: recovery_rate(row["購入"], row["払戻"]), axis=1)
     summary["sort_key"] = summary["amount_unit"].apply(bet_unit_sort_key)
@@ -735,6 +748,7 @@ def fetch_races() -> pd.DataFrame:
             FROM bets
             GROUP BY race_id
         ) bc ON bc.race_id = r.id
+        WHERE COALESCE(r.source_status, '') NOT IN ('TIPSTAR年次差額調整')
         ORDER BY r.race_date DESC, r.id DESC
     """
     with get_conn() as conn:
@@ -854,7 +868,8 @@ def fetch_all_bets() -> pd.DataFrame:
             r.venue,
             r.race_no,
             r.grade,
-            r.status
+            r.status,
+            r.source_status
         FROM bets b
         JOIN races r ON r.id = b.race_id
         ORDER BY r.race_date DESC, b.id DESC
@@ -864,6 +879,12 @@ def fetch_all_bets() -> pd.DataFrame:
     if not df.empty:
         df["収支"] = df.apply(lambda row: profit(row["stake"], row["payout"]), axis=1)
     return df
+
+
+def exclude_adjustment_bets(bets: pd.DataFrame) -> pd.DataFrame:
+    if bets.empty or "source_status" not in bets.columns:
+        return bets
+    return bets[~bets["source_status"].fillna("").astype(str).isin(ADJUSTMENT_SOURCE_STATUSES)].copy()
 
 
 def fetch_all_riders() -> pd.DataFrame:
@@ -3230,8 +3251,9 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None, sync_res
         return
 
     bets = fetch_all_bets()
+    hit_rate_bets = exclude_adjustment_bets(bets)
     unit = summary_unit(bets)
-    hit_count = int(bets["hit"].sum()) if not bets.empty else 0
+    hit_count = int(hit_rate_bets["hit"].sum()) if not hit_rate_bets.empty else 0
     race_count = len(races)
     rider_done = int((races["rider_count"] > 0).sum())
     line_done = int((races["line_count"] > 0).sum())
@@ -3242,7 +3264,7 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None, sync_res
     col2.metric("選手補完率", rate_text(rider_done, race_count), f"{rider_done}/{race_count}")
     col3.metric("ライン補完率", rate_text(line_done, race_count), f"{line_done}/{race_count}")
     col4.metric("振り返り完了率", rate_text(review_done, race_count), f"{review_done}/{race_count}")
-    col5.metric("的中率", f"{hit_rate(hit_count, len(bets))}%" if not bets.empty else "0.0%")
+    col5.metric("的中率", f"{hit_rate(hit_count, len(hit_rate_bets))}%" if not hit_rate_bets.empty else "0.0%")
 
     render_today_races_panel(races, sync_result)
 
