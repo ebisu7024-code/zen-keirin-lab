@@ -980,6 +980,200 @@ def fetch_rider_purchase_summary() -> pd.DataFrame:
     return summary.sort_values(["購入額", "買い目登場数"], ascending=False)
 
 
+def prepare_rider_result_details(details: pd.DataFrame) -> pd.DataFrame:
+    if details.empty:
+        return details.copy()
+
+    prepared = details.copy()
+    prepared["finish_order"] = pd.to_numeric(prepared.get("finish_order"), errors="coerce")
+    prepared["racing_score"] = pd.to_numeric(prepared.get("racing_score"), errors="coerce").fillna(0.0)
+    agari_text = prepared.get("agari", pd.Series([""] * len(prepared))).fillna("").astype(str)
+    prepared["agari_num"] = pd.to_numeric(agari_text.str.extract(r"(\d+(?:\.\d+)?)", expand=False), errors="coerce")
+
+    prepared["result_done"] = prepared["finish_order"].notna()
+    prepared["first"] = prepared["finish_order"].eq(1)
+    prepared["second"] = prepared["finish_order"].eq(2)
+    prepared["third"] = prepared["finish_order"].eq(3)
+    prepared["top2"] = prepared["finish_order"].isin([1, 2])
+    prepared["top3"] = prepared["finish_order"].isin([1, 2, 3])
+    prepared["out"] = prepared["result_done"] & ~prepared["top3"]
+
+    line_status = prepared.get("line_auto_status", pd.Series([""] * len(prepared))).fillna("").astype(str)
+    prepared["line_status_done"] = line_status.isin(["機能", "半機能", "崩れ"])
+    prepared["line_function"] = line_status.isin(["機能", "半機能"])
+    prepared["line_collapse"] = line_status.eq("崩れ")
+
+    position = prepared.get("line_position", pd.Series(["不明"] * len(prepared))).fillna("不明").astype(str)
+    prepared["leader_first"] = position.eq("先頭") & prepared["first"]
+    prepared["leader_top3"] = position.eq("先頭") & prepared["top3"]
+    prepared["second_first"] = position.eq("番手") & prepared["first"]
+    prepared["second_top2"] = position.eq("番手") & prepared["top2"]
+    prepared["second_top3"] = position.eq("番手") & prepared["top3"]
+    prepared["third_top3"] = position.eq("3番手") & prepared["top3"]
+    prepared["single_first"] = position.eq("単騎") & prepared["first"]
+    prepared["single_top3"] = position.eq("単騎") & prepared["top3"]
+    return prepared
+
+
+def fetch_rider_result_details() -> pd.DataFrame:
+    query = """
+        SELECT
+            r.race_id,
+            races.race_date,
+            races.venue,
+            races.race_no,
+            races.grade,
+            r.car_no,
+            r.rider_name,
+            r.prefecture,
+            r.racing_score,
+            r.style,
+            COALESCE(NULLIF(r.line_name, ''), '未設定') AS line_name,
+            COALESCE(NULLIF(r.line_position, ''), '不明') AS line_position,
+            r.final_mark,
+            COALESCE(lines.auto_status, '') AS line_auto_status,
+            result_rows.finish_order,
+            result_rows.agari,
+            result_rows.decision,
+            result_rows.sb
+        FROM riders r
+        JOIN races ON races.id = r.race_id
+        LEFT JOIN race_lines lines
+            ON lines.race_id = r.race_id
+           AND lines.line_key = r.line_name
+        LEFT JOIN race_result_rows result_rows
+            ON result_rows.race_id = r.race_id
+           AND result_rows.car_no = r.car_no
+        WHERE COALESCE(r.rider_name, '') <> ''
+          AND COALESCE(races.source_status, '') NOT IN ('TIPSTAR年次差額調整')
+        ORDER BY races.race_date DESC, races.id DESC, r.car_no
+    """
+    with get_conn() as conn:
+        details = pd.read_sql_query(query, conn)
+    return prepare_rider_result_details(details)
+
+
+def rider_position_watch_point(row: pd.Series | dict) -> str:
+    position = row.get("line_position", "不明")
+    result_count = int(row.get("結果あり", 0) or 0)
+    if result_count == 0:
+        return "結果補完待ち。着順が入ると位置別の癖を見られます。"
+
+    first_rate = float(row.get("1着率", 0.0) or 0.0)
+    top2_rate = float(row.get("2着以内率", 0.0) or 0.0)
+    top3_rate = float(row.get("3着内率", 0.0) or 0.0)
+    collapse_rate = float(row.get("ライン崩れ率", 0.0) or 0.0)
+
+    if position == "先頭":
+        if first_rate >= 30.0:
+            return "先頭で頭まで取り切る形を確認。1着固定の候補。"
+        if top3_rate >= 60.0:
+            return "先頭で残るが頭までは慎重。折り返しや2・3着残りを確認。"
+        return "先頭でも残り切れない傾向。別線まくりや番手差しに注意。"
+    if position == "番手":
+        if first_rate >= 25.0:
+            return "番手差し候補。先頭との折り返しを検討。"
+        if top2_rate >= 60.0:
+            return "番手で連対しやすい。2着固定・ワンツー候補。"
+        return "番手でも伸び切らない傾向。ライン機能率と展開待ちを確認。"
+    if position == "3番手":
+        if top3_rate >= 45.0:
+            return "3番手で3着に残る形あり。三連系の押さえ候補。"
+        return "3番手からの残りは薄め。ライン独占を買う根拠を確認。"
+    if position == "単騎":
+        if top3_rate >= 30.0:
+            return "単騎で3着内に入る余地あり。穴の3着候補。"
+        return "単騎の浮上は低め。位置取りと展開待ちの根拠を確認。"
+    if collapse_rate >= 50.0:
+        return "ライン崩れが多め。位置情報を補正してから扱いたい選手。"
+    return "サンプルを蓄積中。場・級班・並びと一緒に確認。"
+
+
+def build_rider_position_summary(details: pd.DataFrame, min_races: int = 1) -> pd.DataFrame:
+    if details.empty:
+        return pd.DataFrame()
+
+    prepared = prepare_rider_result_details(details)
+    summary = (
+        prepared.groupby(["rider_name", "prefecture", "line_position"], dropna=False)
+        .agg(
+            出走数=("race_id", "nunique"),
+            結果あり=("result_done", "sum"),
+            一着=("first", "sum"),
+            二着=("second", "sum"),
+            三着=("third", "sum"),
+            三着内=("top3", "sum"),
+            着外=("out", "sum"),
+            平均競走得点=("racing_score", "mean"),
+            平均上がり=("agari_num", "mean"),
+            ライン判定数=("line_status_done", "sum"),
+            ライン機能数=("line_function", "sum"),
+            ライン崩れ数=("line_collapse", "sum"),
+            先頭一着=("leader_first", "sum"),
+            先頭三着内=("leader_top3", "sum"),
+            番手一着=("second_first", "sum"),
+            番手二着以内=("second_top2", "sum"),
+            番手三着内=("second_top3", "sum"),
+            三番手三着内=("third_top3", "sum"),
+            単騎一着=("single_first", "sum"),
+            単騎三着内=("single_top3", "sum"),
+            最終出走日=("race_date", "max"),
+        )
+        .reset_index()
+    )
+    if min_races > 1:
+        summary = summary[summary["出走数"] >= int(min_races)].copy()
+    if summary.empty:
+        return summary
+
+    count_columns = [
+        "出走数",
+        "結果あり",
+        "一着",
+        "二着",
+        "三着",
+        "三着内",
+        "着外",
+        "ライン判定数",
+        "ライン機能数",
+        "ライン崩れ数",
+        "先頭一着",
+        "先頭三着内",
+        "番手一着",
+        "番手二着以内",
+        "番手三着内",
+        "三番手三着内",
+        "単騎一着",
+        "単騎三着内",
+    ]
+    for column in count_columns:
+        summary[column] = summary[column].fillna(0).astype(int)
+
+    summary["1着率"] = summary.apply(lambda row: hit_rate(int(row["一着"]), int(row["結果あり"])), axis=1)
+    summary["2着以内率"] = summary.apply(
+        lambda row: hit_rate(int(row["一着"] + row["二着"]), int(row["結果あり"])),
+        axis=1,
+    )
+    summary["3着内率"] = summary.apply(lambda row: hit_rate(int(row["三着内"]), int(row["結果あり"])), axis=1)
+    summary["ライン機能率"] = summary.apply(
+        lambda row: hit_rate(int(row["ライン機能数"]), int(row["ライン判定数"])),
+        axis=1,
+    )
+    summary["ライン崩れ率"] = summary.apply(
+        lambda row: hit_rate(int(row["ライン崩れ数"]), int(row["ライン判定数"])),
+        axis=1,
+    )
+    summary["平均競走得点"] = summary["平均競走得点"].fillna(0.0).round(2)
+    summary["平均上がり"] = summary["平均上がり"].round(2)
+    summary["選手"] = summary.apply(
+        lambda row: f"{row['rider_name']}（{row['prefecture']}）" if row.get("prefecture") else row["rider_name"],
+        axis=1,
+    )
+    summary["選手位置"] = summary["選手"] + " / " + summary["line_position"].fillna("不明")
+    summary["見るポイント"] = summary.apply(rider_position_watch_point, axis=1)
+    return summary.sort_values(["出走数", "3着内率", "1着率"], ascending=False).reset_index(drop=True)
+
+
 def upsert_race(race_id: int | None, payload: dict) -> int:
     timestamp = now_text()
     fields = [
@@ -3249,6 +3443,173 @@ def render_rider_purchase_insights() -> None:
     )
 
 
+def render_rider_position_insights() -> None:
+    st.subheader("選手別ポジション成績")
+    details = fetch_rider_result_details()
+    summary = build_rider_position_summary(details)
+    if summary.empty:
+        st.info("選手名と結果詳細が補完されると、位置別の1着率・3着内率・ライン機能率を表示できます。")
+        return
+
+    max_races = max(int(summary["出走数"].max()), 1)
+    position_options = [position for position in POSITION_OPTIONS if position in summary["line_position"].unique()]
+    default_positions = [position for position in ["先頭", "番手", "3番手", "単騎"] if position in position_options]
+    col_filter, col_metric, col_count = st.columns([2, 1, 1])
+    selected_positions = col_filter.multiselect(
+        "見る位置",
+        position_options,
+        default=default_positions or position_options,
+        key="rider_position_filter",
+    )
+    sort_metric = col_metric.selectbox(
+        "見る指標",
+        ["3着内率", "1着率", "2着以内率", "ライン機能率", "ライン崩れ率", "出走数", "平均競走得点"],
+        key="rider_position_metric",
+    )
+    min_races = col_count.slider("最少出走数", min_value=1, max_value=max_races, value=min(3, max_races), key="rider_position_min")
+    rider_query = st.text_input("選手名で絞り込み", value="", key="rider_position_query")
+
+    view = summary[summary["出走数"] >= int(min_races)].copy()
+    if selected_positions:
+        view = view[view["line_position"].isin(selected_positions)].copy()
+    if rider_query.strip():
+        view = view[view["rider_name"].str.contains(rider_query.strip(), case=False, na=False)].copy()
+    if view.empty:
+        st.info("条件に合う選手データはありません。最少出走数や位置フィルタを緩めてください。")
+        return
+
+    top = view.sort_values([sort_metric, "出走数", "3着内率"], ascending=False).head(20)
+    best_row = top.iloc[0]
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("対象選手", f"{view['rider_name'].nunique():,}人")
+    col2.metric("対象サンプル", f"{int(view['出走数'].sum()):,}走")
+    col3.metric("上位", str(best_row["選手位置"]))
+    col4.metric(sort_metric, f"{float(best_row[sort_metric]):.1f}%" if sort_metric.endswith("率") else f"{float(best_row[sort_metric]):,.1f}")
+
+    text_template = "%{x:.1f}%" if sort_metric.endswith("率") else ("%{x:,.0f}" if sort_metric == "出走数" else "%{x:.2f}")
+    fig = horizontal_bar(
+        top,
+        label_col="選手位置",
+        value_col=sort_metric,
+        color_col="3着内率",
+        continuous_color=True,
+        title=f"選手別ポジション成績 TOP{len(top)}",
+        x_title=sort_metric,
+        hover_data=["出走数", "結果あり", "1着率", "2着以内率", "3着内率", "ライン機能率", "ライン崩れ率", "最終出走日"],
+        text_template=text_template,
+        color_scale=["#475569", "#38bdf8", "#22c55e"],
+    )
+    if sort_metric.endswith("率"):
+        fig.update_xaxes(range=[0, 100])
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("着順・ライン位置・ライン自動判定だけを使った事実ベースの集計です。心理・関係性評価はここでは混ぜません。")
+
+    display_columns = [
+        "選手",
+        "line_position",
+        "出走数",
+        "結果あり",
+        "一着",
+        "二着",
+        "三着",
+        "三着内",
+        "1着率",
+        "2着以内率",
+        "3着内率",
+        "ライン機能率",
+        "ライン崩れ率",
+        "平均競走得点",
+        "平均上がり",
+        "最終出走日",
+        "見るポイント",
+    ]
+    st.dataframe(
+        view.sort_values([sort_metric, "出走数", "3着内率"], ascending=False)[display_columns]
+        .head(80)
+        .rename(
+            columns={
+                "line_position": "位置",
+                "一着": "1着",
+                "二着": "2着",
+                "三着": "3着",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    rider_options = view.sort_values(["出走数", "3着内率"], ascending=False)["rider_name"].drop_duplicates().tolist()
+    selected_rider = st.selectbox("選手カード", rider_options, key="rider_position_card")
+    rider_rows = summary[summary["rider_name"] == selected_rider].sort_values(["出走数", "3着内率"], ascending=False)
+    if rider_rows.empty:
+        return
+
+    st.markdown("#### 選手カード")
+    card_cols = st.columns(4)
+    card_cols[0].metric("出走サンプル", f"{int(rider_rows['出走数'].sum()):,}走")
+    card_cols[1].metric("最高3着内率", f"{float(rider_rows['3着内率'].max()):.1f}%")
+    card_cols[2].metric("最高1着率", f"{float(rider_rows['1着率'].max()):.1f}%")
+    card_cols[3].metric("主な位置", str(rider_rows.iloc[0]["line_position"]))
+    st.dataframe(
+        rider_rows[
+            [
+                "line_position",
+                "出走数",
+                "結果あり",
+                "1着率",
+                "2着以内率",
+                "3着内率",
+                "ライン機能率",
+                "ライン崩れ率",
+                "平均競走得点",
+                "平均上がり",
+                "見るポイント",
+            ]
+        ].rename(columns={"line_position": "位置"}),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    rider_history = details[details["rider_name"] == selected_rider].copy()
+    if not rider_history.empty:
+        st.markdown("#### 直近履歴")
+        rider_history["着順"] = rider_history["finish_order"].apply(lambda value: "" if pd.isna(value) else int(value))
+        st.dataframe(
+            rider_history[
+                [
+                    "race_date",
+                    "venue",
+                    "race_no",
+                    "grade",
+                    "car_no",
+                    "line_position",
+                    "line_auto_status",
+                    "着順",
+                    "agari",
+                    "decision",
+                    "sb",
+                ]
+            ]
+            .head(12)
+            .rename(
+                columns={
+                    "race_date": "日付",
+                    "venue": "場",
+                    "race_no": "R",
+                    "grade": "級",
+                    "car_no": "車番",
+                    "line_position": "位置",
+                    "line_auto_status": "ライン結果",
+                    "agari": "上り",
+                    "decision": "決まり手",
+                    "sb": "S/B",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def render_dashboard(races: pd.DataFrame, selected_race_id: int | None, sync_result: dict | None = None) -> None:
     render_header(None)
     if races.empty:
@@ -4231,6 +4592,8 @@ def render_review(selected_race_id: int | None) -> None:
         )
         fig.update_layout(coloraxis_cmid=100)
         st.plotly_chart(fig, use_container_width=True)
+
+    render_rider_position_insights()
 
     if selected_race_id:
         riders = fetch_riders(selected_race_id)

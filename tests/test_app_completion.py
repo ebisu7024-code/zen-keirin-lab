@@ -121,6 +121,87 @@ class AppCompletionTest(unittest.TestCase):
         self.assertEqual(lines["car_numbers"].tolist(), ["1-2", "3"])
         self.assertEqual(lines["auto_status"].tolist(), ["未評価", "未評価"])
 
+    def test_rider_position_summary_tracks_line_position_outcomes(self):
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-08-02",
+                "venue": "奈良",
+                "race_no": 3,
+                "grade": "F2",
+                "distance": 1682,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "円",
+                "status": "結果入力済み",
+                "race_title": "",
+                "source_ref": "",
+                "line_summary": "1-2 / 3",
+                "race_memo": "",
+            },
+        )
+        base_payload = {
+            "prefecture": "",
+            "age": 0,
+            "racing_score": 90.0,
+            "style": "不明",
+            "recent_results": "",
+            "rider_comment": "",
+            "rider_class": "",
+            "term": "",
+            "post_race_comment": "",
+            "comment_eval": "",
+            "ability_score": 50,
+            "development_score": 50,
+            "mental_score": 50,
+            "relationship_score": 50,
+            "confidence": "中",
+            "info_type": "事実",
+            "human_note": "",
+            "final_mark": "",
+            "user_note": "",
+        }
+        app.upsert_rider(
+            race_id,
+            1,
+            {**base_payload, "rider_name": "山田太郎", "line_name": "ライン1", "line_position": "先頭"},
+        )
+        app.upsert_rider(
+            race_id,
+            2,
+            {**base_payload, "rider_name": "佐藤次郎", "line_name": "ライン1", "line_position": "番手"},
+        )
+        app.upsert_rider(
+            race_id,
+            3,
+            {**base_payload, "rider_name": "鈴木三郎", "line_name": "ライン2", "line_position": "単騎"},
+        )
+        with app.get_conn() as conn:
+            app.save_result_rows(
+                conn,
+                race_id,
+                (
+                    WinticketResultRow(1, 1, "山田太郎", agari="11.8", decision="逃げ"),
+                    WinticketResultRow(2, 2, "佐藤次郎", agari="11.9", decision="マーク"),
+                    WinticketResultRow(3, 3, "鈴木三郎", agari="12.1", decision="捲り"),
+                ),
+            )
+            app.save_lines(conn, race_id, "1-2 / 3", (1, 2, 3))
+
+        details = app.fetch_rider_result_details()
+        summary = app.build_rider_position_summary(details)
+        leader = summary[(summary["rider_name"] == "山田太郎") & (summary["line_position"] == "先頭")].iloc[0]
+        second = summary[(summary["rider_name"] == "佐藤次郎") & (summary["line_position"] == "番手")].iloc[0]
+        single = summary[(summary["rider_name"] == "鈴木三郎") & (summary["line_position"] == "単騎")].iloc[0]
+
+        self.assertEqual(int(leader["出走数"]), 1)
+        self.assertEqual(float(leader["1着率"]), 100.0)
+        self.assertEqual(float(leader["ライン機能率"]), 100.0)
+        self.assertEqual(int(second["番手二着以内"]), 1)
+        self.assertEqual(float(second["2着以内率"]), 100.0)
+        self.assertEqual(int(single["単騎三着内"]), 1)
+        self.assertEqual(float(single["3着内率"]), 100.0)
+
     def test_winticket_candidates_include_missing_riders_or_lines(self):
         races = pd.DataFrame(
             [
