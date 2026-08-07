@@ -2378,25 +2378,24 @@ def render_database_admin_panel() -> None:
             st.caption("現在のDBはまだ作成されていません。")
 
         uploaded_db = st.file_uploader(
-            "SQLite DBをアップロード",
+            "復元するSQLite DBをアップロード",
             type=["sqlite3", "sqlite", "db"],
             key="restore_database_upload",
         )
-        overwrite_confirmed = st.checkbox(
-            "Render側DBをこのファイルで上書きする",
-            key="restore_database_confirm",
-        )
-        restore_clicked = st.button(
-            "DBを復元",
-            disabled=uploaded_db is None or not overwrite_confirmed,
-            use_container_width=True,
-        )
-        if restore_clicked and uploaded_db is not None:
+        if uploaded_db is not None:
+            upload_fingerprint = f"{uploaded_db.name}:{uploaded_db.size}"
+            restored_fingerprint = st.session_state.get("restore_database_fingerprint")
+            if upload_fingerprint == restored_fingerprint:
+                st.success("このDBは復元済みです。")
+                return
+
+            st.caption("アップロード後、自動でRender側DBを上書き復元します。")
             try:
                 restored_counts = restore_database(uploaded_db)
             except ValueError as exc:
                 st.error(str(exc))
             else:
+                st.session_state["restore_database_fingerprint"] = upload_fingerprint
                 st.session_state.pop("selected_race_id", None)
                 st.success(
                     "DBを復元しました。"
