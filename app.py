@@ -5,6 +5,7 @@ import hmac
 import importlib
 import math
 import os
+import shutil
 import sqlite3
 import re
 from datetime import date, datetime
@@ -113,6 +114,15 @@ TIP_MEDAL_DAILY_GRANT = 10000
 TIP_MEDAL_RESET_TEXT = "翌日3:00"
 TODAY_SYNC_VERSION = "racecard-index-v4"
 ADJUSTMENT_SOURCE_STATUSES = {"TIPSTAR年次差額調整"}
+REQUIRED_DB_TABLES = (
+    "races",
+    "riders",
+    "bets",
+    "results",
+    "race_result_rows",
+    "race_payouts",
+    "race_lines",
+)
 
 
 def streamlit_secret_text(*keys: str) -> str:
@@ -416,6 +426,62 @@ def init_db() -> None:
             WHERE amount_unit IS NULL OR amount_unit = ''
             """
         )
+
+
+def database_counts(db_path: Path = DB_PATH) -> dict[str, int]:
+    if not db_path.exists():
+        return {}
+    with sqlite3.connect(db_path) as conn:
+        table_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        counts: dict[str, int] = {}
+        for table in REQUIRED_DB_TABLES:
+            if table in table_names:
+                counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        return counts
+
+
+def validate_database_file(db_path: Path) -> dict[str, int]:
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        raise ValueError("SQLiteファイルが空です。")
+    try:
+        with sqlite3.connect(db_path) as conn:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise ValueError(f"SQLite integrity_check が失敗しました: {integrity}")
+            table_names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            missing = [table for table in REQUIRED_DB_TABLES if table not in table_names]
+            if missing:
+                raise ValueError(f"必要なテーブルがありません: {', '.join(missing)}")
+            return database_counts(db_path)
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"SQLiteとして読み込めません: {exc}") from exc
+
+
+def restore_database(uploaded_file) -> dict[str, int]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    upload_path = DB_PATH.with_name(f".{DB_PATH.name}.upload")
+    upload_path.write_bytes(uploaded_file.getbuffer())
+    counts = validate_database_file(upload_path)
+
+    if DB_PATH.exists():
+        backup_dir = DATA_DIR / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_name = f"{DB_PATH.stem}.{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak{DB_PATH.suffix}"
+        shutil.copy2(DB_PATH, backup_dir / backup_name)
+
+    os.replace(upload_path, DB_PATH)
+    init_db()
+    return counts
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict:
@@ -2287,6 +2353,60 @@ def render_page_race_selector(
     return next_race_id
 
 
+def render_database_admin_panel() -> None:
+    with st.sidebar.expander("DBバックアップ/復元"):
+        counts = database_counts()
+        if counts:
+            st.caption(
+                "現在: "
+                f"レース{counts.get('races', 0):,}件 / "
+                f"選手{counts.get('riders', 0):,}件 / "
+                f"買い目{counts.get('bets', 0):,}件 / "
+                f"結果{counts.get('results', 0):,}件"
+            )
+            try:
+                st.download_button(
+                    "現在のDBをダウンロード",
+                    data=DB_PATH.read_bytes(),
+                    file_name="zen_keirin_lab.sqlite3",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+            except OSError as exc:
+                st.warning(f"DBを読み出せませんでした: {exc}")
+        else:
+            st.caption("現在のDBはまだ作成されていません。")
+
+        uploaded_db = st.file_uploader(
+            "SQLite DBをアップロード",
+            type=["sqlite3", "sqlite", "db"],
+            key="restore_database_upload",
+        )
+        overwrite_confirmed = st.checkbox(
+            "Render側DBをこのファイルで上書きする",
+            key="restore_database_confirm",
+        )
+        restore_clicked = st.button(
+            "DBを復元",
+            disabled=uploaded_db is None or not overwrite_confirmed,
+            use_container_width=True,
+        )
+        if restore_clicked and uploaded_db is not None:
+            try:
+                restored_counts = restore_database(uploaded_db)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop("selected_race_id", None)
+                st.success(
+                    "DBを復元しました。"
+                    f"レース{restored_counts.get('races', 0):,}件 / "
+                    f"選手{restored_counts.get('riders', 0):,}件 / "
+                    f"買い目{restored_counts.get('bets', 0):,}件"
+                )
+                st.rerun()
+
+
 def sidebar_select_race(races: pd.DataFrame) -> int | None:
     st.sidebar.title("zenKeirin Lab")
     page_options = ["ダッシュボード", "競輪場特徴", "レース登録", "選手評価", "展開予想", "買い目・結果", "振り返り"]
@@ -2297,6 +2417,7 @@ def sidebar_select_race(races: pd.DataFrame) -> int | None:
         index=page_options.index(current_page) if current_page in page_options else 0,
     )
     st.session_state["page"] = page
+    render_database_admin_panel()
 
     if races.empty:
         st.sidebar.info("まだレースがありません。")
