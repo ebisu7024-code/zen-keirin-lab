@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: transparent;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: transparent;
+      color: #e5edf5;
+      overflow: hidden;
+    }
+
+    .shell {
+      min-height: 500px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background:
+        radial-gradient(ellipse at center, rgba(15, 23, 42, 0.9) 0%, rgba(15, 23, 42, 0.9) 43%, transparent 44%),
+        linear-gradient(135deg, #111827, #18212f 55%, #111827);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .toolbar {
+      position: absolute;
+      z-index: 4;
+      top: 12px;
+      left: 14px;
+      right: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      pointer-events: none;
+    }
+
+    .title {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+      color: #f8fafc;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .title small {
+      color: #aab4c2;
+      font-weight: 650;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: min(56vw, 520px);
+    }
+
+    .reset {
+      pointer-events: auto;
+      border: 1px solid #475569;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.88);
+      color: #e2e8f0;
+      min-height: 34px;
+      padding: 0 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .reset:hover {
+      border-color: #94a3b8;
+      background: rgba(30, 41, 59, 0.95);
+    }
+
+    .track {
+      position: absolute;
+      inset: 42px 50px 38px;
+      border: 28px solid #475569;
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 2px rgba(226, 232, 240, 0.14) inset,
+        0 0 0 2px rgba(226, 232, 240, 0.18),
+        0 24px 44px rgba(0, 0, 0, 0.25);
+    }
+
+    .track::before {
+      content: "";
+      position: absolute;
+      inset: 27px 38px;
+      border: 2px dashed rgba(226, 232, 240, 0.18);
+      border-radius: 50%;
+    }
+
+    .finish {
+      position: absolute;
+      top: 54px;
+      right: 72px;
+      z-index: 2;
+      padding: 4px 8px;
+      border-left: 3px solid #f8fafc;
+      color: #f8fafc;
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0;
+      background: rgba(15, 23, 42, 0.72);
+    }
+
+    .center-label {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: min(74%, 480px);
+      color: #cbd5e1;
+      text-align: center;
+      font-weight: 750;
+      line-height: 1.55;
+      word-break: break-word;
+    }
+
+    .piece {
+      --line-color: #38bdf8;
+      --car-color: #f8fafc;
+      --car-text-color: #020617;
+      --car-border-color: #e2e8f0;
+      position: absolute;
+      z-index: 3;
+      left: calc(var(--x) * 1%);
+      top: calc(var(--y) * 1%);
+      width: 96px;
+      min-height: 64px;
+      transform: translate(-50%, -50%);
+      border-radius: 8px;
+      border: 2px solid var(--car-border-color);
+      background: var(--car-color);
+      color: var(--car-text-color);
+      padding: 8px;
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.3);
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+      transition: box-shadow 120ms ease, border-color 120ms ease, background 120ms ease;
+    }
+
+    .piece:active,
+    .piece.is-dragging {
+      cursor: grabbing;
+      z-index: 6;
+      box-shadow: 0 0 0 4px rgba(248, 250, 252, 0.18), 0 18px 34px rgba(0, 0, 0, 0.38);
+    }
+
+    .piece.is-active {
+      box-shadow: 0 0 0 3px rgba(248, 250, 252, 0.18), 0 12px 24px rgba(0, 0, 0, 0.3);
+    }
+
+    .piece.is-projected {
+      box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.32), 0 12px 24px rgba(0, 0, 0, 0.3);
+    }
+
+    .top-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .car-no {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: rgba(15, 23, 42, 0.16);
+      color: var(--car-text-color);
+      font-weight: 950;
+      font-size: 16px;
+      box-shadow: 0 0 0 1px rgba(248, 250, 252, 0.2) inset;
+    }
+
+    .line-name {
+      color: var(--car-text-color);
+      font-size: 13px;
+      font-weight: 850;
+      opacity: 0.86;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .name {
+      display: block;
+      margin-top: 6px;
+      color: var(--car-text-color);
+      font-size: 12px;
+      font-weight: 700;
+      opacity: 0.82;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .rank {
+      position: absolute;
+      top: -12px;
+      right: -10px;
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: #f8fafc;
+      color: #020617;
+      font-size: 12px;
+      font-weight: 950;
+      box-shadow: 0 8px 16px rgba(0, 0, 0, 0.26);
+    }
+
+    .legend {
+      position: absolute;
+      z-index: 4;
+      left: 14px;
+      right: 14px;
+      bottom: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      pointer-events: none;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 180px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.72);
+      color: #dbeafe;
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 750;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--line-color);
+    }
+
+    @media (max-width: 640px) {
+      .shell {
+        min-height: 520px;
+      }
+
+      .track {
+        inset: 58px 26px 54px;
+        border-width: 20px;
+      }
+
+      .piece {
+        width: 78px;
+        min-height: 58px;
+        padding: 7px;
+      }
+
+      .car-no {
+        width: 25px;
+        height: 25px;
+        font-size: 14px;
+      }
+
+      .line-name,
+      .name {
+        font-size: 11px;
+      }
+
+      .finish {
+        top: 70px;
+        right: 34px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const root = document.getElementById("root");
+    let args = {};
+    let pieces = [];
+    let activePiece = null;
+    let pointerOffset = { x: 0, y: 0 };
+
+    function post(type, data) {
+      window.parent.postMessage({ isStreamlitMessage: true, type, ...data }, "*");
+    }
+
+    function setReady() {
+      post("streamlit:componentReady", { apiVersion: 1 });
+    }
+
+    function setHeight() {
+      const height = Math.max(document.documentElement.scrollHeight, 520);
+      post("streamlit:setFrameHeight", { height });
+    }
+
+    function setValue(action, lastMoved) {
+      const positions = {};
+      const orderedCars = [...pieces]
+        .sort((a, b) => (a.y - b.y) || (a.x - b.x))
+        .map((piece) => piece.carNo);
+
+      for (const piece of pieces) {
+        positions[String(piece.carNo)] = {
+          x: Number(piece.x.toFixed(1)),
+          y: Number(piece.y.toFixed(1)),
+        };
+      }
+
+      post("streamlit:setComponentValue", {
+        dataType: "json",
+        value: {
+          action,
+          lastMoved,
+          positions,
+          orderedCars,
+          lineSummary: args.line_summary || "",
+          updatedAt: Date.now(),
+        },
+      });
+    }
+
+    function escapeText(value) {
+      const span = document.createElement("span");
+      span.textContent = value == null ? "" : String(value);
+      return span.innerHTML;
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function pieceHtml(piece) {
+      const classes = ["piece"];
+      if (piece.isActive) classes.push("is-active");
+      if (piece.projectedRank) classes.push("is-projected");
+      const rank = piece.projectedRank
+        ? `<span class="rank">${piece.projectedRank}着</span>`
+        : "";
+      const name = piece.name ? escapeText(piece.name) : escapeText(piece.linePosition || "");
+
+      return `
+        <div
+          class="${classes.join(" ")}"
+          data-piece-id="${escapeText(piece.id)}"
+          style="--x:${piece.x}; --y:${piece.y}; --line-color:${escapeText(piece.lineColor)}; --car-color:${escapeText(piece.carColor)}; --car-text-color:${escapeText(piece.carTextColor)}; --car-border-color:${escapeText(piece.carBorderColor)}"
+          title="${piece.carNo}番 ${escapeText(piece.carColorName || "")}"
+        >
+          ${rank}
+          <div class="top-line">
+            <span class="car-no">${piece.carNo}</span>
+            <span class="line-name">${escapeText(piece.lineLabel)}</span>
+          </div>
+          <span class="name">${name}</span>
+        </div>
+      `;
+    }
+
+    function legendHtml() {
+      const lineMap = new Map();
+      for (const piece of pieces) {
+        if (!lineMap.has(piece.lineLabel)) {
+          lineMap.set(piece.lineLabel, piece.lineColor);
+        }
+      }
+      return [...lineMap.entries()]
+        .map(([label, color]) => `
+          <span class="legend-item">
+            <span class="swatch" style="--line-color:${escapeText(color)}"></span>
+            ${escapeText(label)}
+          </span>
+        `)
+        .join("");
+    }
+
+    function render() {
+      const lineSummary = args.line_summary || "";
+      const activeLine = args.active_line || "";
+      root.innerHTML = `
+        <section class="shell">
+          <div class="track"></div>
+          <div class="finish">FINISH</div>
+          <div class="toolbar">
+            <div class="title">
+              <span>可動バンク</span>
+              <small>${escapeText(activeLine)} / ${escapeText(lineSummary)}</small>
+            </div>
+            <button class="reset" type="button" data-action="reset">配置リセット</button>
+          </div>
+          <div class="center-label">${escapeText(lineSummary).replaceAll(" / ", "<br>")}</div>
+          ${pieces.map(pieceHtml).join("")}
+          <div class="legend">${legendHtml()}</div>
+        </section>
+      `;
+      bindEvents();
+      setHeight();
+    }
+
+    function bindEvents() {
+      const resetButton = root.querySelector("[data-action='reset']");
+      resetButton?.addEventListener("click", () => {
+        pieces = pieces.map((piece) => ({
+          ...piece,
+          x: Number(piece.defaultX),
+          y: Number(piece.defaultY),
+        }));
+        render();
+        setValue("reset", null);
+      });
+
+      for (const element of root.querySelectorAll(".piece")) {
+        element.addEventListener("pointerdown", startDrag);
+      }
+    }
+
+    function boardRect() {
+      return root.querySelector(".shell").getBoundingClientRect();
+    }
+
+    function findPiece(id) {
+      return pieces.find((piece) => piece.id === id);
+    }
+
+    function startDrag(event) {
+      const element = event.currentTarget;
+      const id = element.dataset.pieceId;
+      const piece = findPiece(id);
+      if (!piece) return;
+
+      activePiece = { piece, element };
+      const rect = boardRect();
+      pointerOffset = {
+        x: event.clientX - (rect.left + rect.width * piece.x / 100),
+        y: event.clientY - (rect.top + rect.height * piece.y / 100),
+      };
+      element.classList.add("is-dragging");
+      element.setPointerCapture(event.pointerId);
+      element.addEventListener("pointermove", moveDrag);
+      element.addEventListener("pointerup", endDrag);
+      element.addEventListener("pointercancel", endDrag);
+    }
+
+    function moveDrag(event) {
+      if (!activePiece) return;
+      const rect = boardRect();
+      const x = ((event.clientX - pointerOffset.x - rect.left) / rect.width) * 100;
+      const y = ((event.clientY - pointerOffset.y - rect.top) / rect.height) * 100;
+      activePiece.piece.x = clamp(x, 4, 96);
+      activePiece.piece.y = clamp(y, 4, 96);
+      activePiece.element.style.setProperty("--x", activePiece.piece.x.toFixed(1));
+      activePiece.element.style.setProperty("--y", activePiece.piece.y.toFixed(1));
+    }
+
+    function endDrag(event) {
+      if (!activePiece) return;
+      const moved = activePiece.piece.carNo;
+      activePiece.element.classList.remove("is-dragging");
+      activePiece.element.releasePointerCapture?.(event.pointerId);
+      activePiece.element.removeEventListener("pointermove", moveDrag);
+      activePiece.element.removeEventListener("pointerup", endDrag);
+      activePiece.element.removeEventListener("pointercancel", endDrag);
+      activePiece = null;
+      setValue("move", moved);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.data?.type !== "streamlit:render") return;
+      args = event.data.args || {};
+      pieces = Array.isArray(args.pieces)
+        ? args.pieces.map((piece) => ({
+            ...piece,
+            x: Number(piece.x),
+            y: Number(piece.y),
+            defaultX: Number(piece.defaultX),
+            defaultY: Number(piece.defaultY),
+          }))
+        : [];
+      render();
+    });
+
+    setReady();
+  </script>
+</body>
+</html>

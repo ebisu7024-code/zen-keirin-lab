@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import hmac
 import importlib
 import math
+import os
 import sqlite3
 import re
 from datetime import date, datetime
@@ -11,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 from keirin_logic import (
     TICKET_TYPES,
@@ -39,8 +42,21 @@ fetch_winticket_race_listings = winticket_source_module.fetch_winticket_race_lis
 
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
-DB_PATH = DATA_DIR / "zen_keirin_lab.sqlite3"
+
+
+def configured_db_path() -> Path:
+    db_path = os.environ.get("ZEN_KEIRIN_DB_PATH", "").strip()
+    if db_path:
+        return Path(db_path).expanduser()
+    return APP_DIR / "data" / "zen_keirin_lab.sqlite3"
+
+
+DB_PATH = configured_db_path()
+DATA_DIR = DB_PATH.parent
+LINEUP_BOARD_COMPONENT = components.declare_component(
+    "lineup_board",
+    path=str(APP_DIR / "components" / "lineup_board"),
+)
 
 MARK_OPTIONS = ["", "◎", "○", "▲", "△", "☆", "消", "見送り"]
 INFO_TYPES = ["事実", "本人発言", "過去レース観察", "Hypothesis", "出所不明"]
@@ -82,10 +98,62 @@ DEVELOPMENT_SCENARIOS = {
     },
 }
 BANK_LINE_COLORS = ["#38bdf8", "#22c55e", "#f59e0b", "#f43f5e", "#a78bfa", "#14b8a6", "#fb7185", "#84cc16"]
+CAR_NUMBER_COLORS = {
+    1: {"name": "白", "background": "#f8fafc", "text": "#020617", "border": "#e2e8f0"},
+    2: {"name": "黒", "background": "#111827", "text": "#f8fafc", "border": "#64748b"},
+    3: {"name": "赤", "background": "#dc2626", "text": "#ffffff", "border": "#ef4444"},
+    4: {"name": "青", "background": "#2563eb", "text": "#ffffff", "border": "#60a5fa"},
+    5: {"name": "黄", "background": "#facc15", "text": "#020617", "border": "#fde047"},
+    6: {"name": "緑", "background": "#16a34a", "text": "#ffffff", "border": "#22c55e"},
+    7: {"name": "橙", "background": "#f97316", "text": "#020617", "border": "#fb923c"},
+    8: {"name": "桃", "background": "#ec4899", "text": "#ffffff", "border": "#f472b6"},
+    9: {"name": "紫", "background": "#7c3aed", "text": "#ffffff", "border": "#a78bfa"},
+}
 TIP_MEDAL_DAILY_GRANT = 10000
 TIP_MEDAL_RESET_TEXT = "翌日3:00"
 TODAY_SYNC_VERSION = "racecard-index-v4"
 ADJUSTMENT_SOURCE_STATUSES = {"TIPSTAR年次差額調整"}
+
+
+def streamlit_secret_text(*keys: str) -> str:
+    try:
+        current = st.secrets
+        for key in keys:
+            current = current[key]
+    except (FileNotFoundError, KeyError, TypeError):
+        return ""
+    except Exception:
+        return ""
+    return str(current).strip()
+
+
+def configured_app_password() -> str:
+    return (
+        os.environ.get("ZEN_KEIRIN_APP_PASSWORD", "").strip()
+        or streamlit_secret_text("ZEN_KEIRIN_APP_PASSWORD")
+        or streamlit_secret_text("app_password")
+        or streamlit_secret_text("auth", "password")
+    )
+
+
+def require_app_password() -> None:
+    expected_password = configured_app_password()
+    if not expected_password or st.session_state.get("app_authenticated"):
+        return
+
+    st.title("zenKeirin Lab")
+    st.caption("外部公開モード")
+    with st.form("app_login_form"):
+        password = st.text_input("パスワード", type="password")
+        submitted = st.form_submit_button("開く")
+
+    if submitted:
+        if hmac.compare_digest(password, expected_password):
+            st.session_state["app_authenticated"] = True
+            st.rerun()
+        st.error("パスワードが違います。")
+
+    st.stop()
 
 
 def now_text() -> str:
@@ -2123,9 +2191,9 @@ def apply_style() -> None:
             min-height: 58px;
             transform: translate(-50%, -50%);
             border-radius: 8px;
-            border: 2px solid var(--line-color);
-            background: rgba(15, 23, 42, 0.94);
-            color: #f8fafc;
+            border: 2px solid var(--car-border-color);
+            background: var(--car-color);
+            color: var(--car-text-color);
             padding: 7px 8px;
             box-shadow: 0 12px 24px rgba(0, 0, 0, 0.28);
         }
@@ -2133,7 +2201,7 @@ def apply_style() -> None:
             box-shadow: 0 0 0 3px rgba(248, 250, 252, 0.22), 0 12px 24px rgba(0, 0, 0, 0.28);
         }
         .rider-chip.is-projected {
-            background: rgba(20, 83, 45, 0.94);
+            box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.34), 0 12px 24px rgba(0, 0, 0, 0.28);
         }
         .rider-no {
             display: inline-block;
@@ -2142,16 +2210,21 @@ def apply_style() -> None:
             line-height: 24px;
             text-align: center;
             border-radius: 50%;
-            background: var(--line-color);
-            color: #020617;
+            background: rgba(15, 23, 42, 0.16);
+            color: var(--car-text-color);
             font-weight: 900;
             margin-right: 5px;
+            box-shadow: 0 0 0 1px rgba(248, 250, 252, 0.2) inset;
+        }
+        .rider-chip strong {
+            color: var(--car-text-color);
         }
         .rider-name {
             display: block;
             margin-top: 4px;
             font-size: 12px;
-            color: #cbd5e1;
+            color: var(--car-text-color);
+            opacity: 0.82;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -2176,6 +2249,42 @@ def apply_style() -> None:
 def race_label(row: pd.Series | dict) -> str:
     title = row.get("race_title") or "無題"
     return f"{row.get('race_date')} {row.get('venue')} {int(row.get('race_no', 0))}R | {title}"
+
+
+def render_page_race_selector(
+    races: pd.DataFrame,
+    selected_race_id: int | None,
+    *,
+    label: str,
+    key_prefix: str,
+) -> int | None:
+    if races.empty:
+        return selected_race_id
+
+    ordered = sort_latest_races(races).reset_index(drop=True)
+    labels = [race_label(row) for _, row in ordered.iterrows()]
+    race_ids = [int(row["id"]) for _, row in ordered.iterrows()]
+    selected_value = None
+    try:
+        selected_value = int(selected_race_id) if selected_race_id is not None else None
+    except (TypeError, ValueError):
+        selected_value = None
+    default_index = race_ids.index(selected_value) if selected_value in race_ids else 0
+    selector_key = f"{key_prefix}_race_selector"
+    selector_state_key = f"{key_prefix}_race_selector_id"
+    default_label = labels[default_index]
+
+    if st.session_state.get(selector_state_key) != selected_value and st.session_state.get(selector_key) != default_label:
+        st.session_state[selector_key] = default_label
+        st.session_state[selector_state_key] = selected_value
+
+    selected_label = st.selectbox(label, labels, index=default_index, key=selector_key)
+    next_race_id = race_ids[labels.index(selected_label)]
+    if selected_value != next_race_id:
+        st.session_state["selected_race_id"] = next_race_id
+        st.session_state[selector_state_key] = next_race_id
+        st.rerun()
+    return next_race_id
 
 
 def sidebar_select_race(races: pd.DataFrame) -> int | None:
@@ -2457,6 +2566,110 @@ def project_development_top3(
     if scenario == "別線まくり":
         return unique_top_numbers([*active[:2], *(others[0][:1] if others else ()), *active[2:], *flatten_line_groups(others)])
     return unique_top_numbers([*active, *flatten_line_groups(others)])
+
+
+def default_board_position(chip_index: int, total: int) -> dict[str, float]:
+    spread = 320 if total > 1 else 0
+    angle = math.radians(-24 + (spread * int(chip_index) / max(total - 1, 1)))
+    return {
+        "x": round(50 + 40 * math.cos(angle), 1),
+        "y": round(50 + 34 * math.sin(angle), 1),
+    }
+
+
+def line_member_position(group: tuple[int, ...] | list[int], rider_index: int) -> str:
+    if len(group) == 1:
+        return "単騎"
+    if rider_index == 0:
+        return "先頭"
+    if rider_index == 1:
+        return "番手"
+    return "3番手"
+
+
+def car_number_color_style(car_no: int) -> dict[str, str]:
+    return CAR_NUMBER_COLORS.get(
+        int(car_no),
+        {"name": "不明", "background": "#64748b", "text": "#f8fafc", "border": "#94a3b8"},
+    )
+
+
+def clamp_board_coordinate(value, fallback: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return round(float(fallback), 1)
+    if not math.isfinite(number):
+        return round(float(fallback), 1)
+    return round(max(4.0, min(96.0, number)), 1)
+
+
+def normalize_board_positions(
+    positions,
+    valid_car_numbers: tuple[int, ...] | list[int],
+) -> dict[str, dict[str, float]]:
+    if not isinstance(positions, dict):
+        return {}
+    valid_keys = {str(int(number)) for number in valid_car_numbers}
+    normalized: dict[str, dict[str, float]] = {}
+    for car_key, raw_position in positions.items():
+        key = str(car_key).replace("car-", "")
+        if key not in valid_keys or not isinstance(raw_position, dict):
+            continue
+        normalized[key] = {
+            "x": clamp_board_coordinate(raw_position.get("x"), 50.0),
+            "y": clamp_board_coordinate(raw_position.get("y"), 50.0),
+        }
+    return normalized
+
+
+def lineup_board_pieces(
+    line_groups: tuple[tuple[int, ...], ...] | list[tuple[int, ...]],
+    active_index: int,
+    projected_top3: tuple[int, ...],
+    names: dict[int, str],
+    saved_positions: dict[str, dict[str, float]] | None = None,
+) -> list[dict]:
+    total = len(flatten_line_groups(line_groups))
+    if total == 0:
+        return []
+    saved_positions = saved_positions or {}
+    active_numbers = set(line_groups[active_index]) if 0 <= active_index < len(line_groups) else set()
+    projected_rank = {int(number): index + 1 for index, number in enumerate(projected_top3)}
+    pieces: list[dict] = []
+    chip_index = 0
+    for line_index, group in enumerate(line_groups):
+        line_color = BANK_LINE_COLORS[line_index % len(BANK_LINE_COLORS)]
+        for rider_index, number in enumerate(group):
+            car_no = int(number)
+            car_color = car_number_color_style(car_no)
+            default_position = default_board_position(chip_index, total)
+            saved_position = saved_positions.get(str(car_no), {})
+            x = clamp_board_coordinate(saved_position.get("x"), default_position["x"])
+            y = clamp_board_coordinate(saved_position.get("y"), default_position["y"])
+            pieces.append(
+                {
+                    "id": f"car-{car_no}",
+                    "carNo": car_no,
+                    "name": names.get(car_no, ""),
+                    "lineLabel": f"ライン{line_index + 1}",
+                    "lineIndex": line_index,
+                    "linePosition": line_member_position(group, rider_index),
+                    "lineColor": line_color,
+                    "carColorName": car_color["name"],
+                    "carColor": car_color["background"],
+                    "carTextColor": car_color["text"],
+                    "carBorderColor": car_color["border"],
+                    "isActive": car_no in active_numbers,
+                    "projectedRank": projected_rank.get(car_no, 0),
+                    "x": x,
+                    "y": y,
+                    "defaultX": default_position["x"],
+                    "defaultY": default_position["y"],
+                }
+            )
+            chip_index += 1
+    return pieces
 
 
 def empty_development_history() -> pd.DataFrame:
@@ -2864,8 +3077,9 @@ def virtual_bank_html(
     chip_index = 0
     spread = 320 if total > 1 else 0
     for line_index, group in enumerate(line_groups):
-        color = BANK_LINE_COLORS[line_index % len(BANK_LINE_COLORS)]
+        line_color = BANK_LINE_COLORS[line_index % len(BANK_LINE_COLORS)]
         for number in group:
+            car_color = car_number_color_style(int(number))
             angle = math.radians(-24 + (spread * chip_index / max(total - 1, 1)))
             left = 50 + 40 * math.cos(angle)
             top = 50 + 34 * math.sin(angle)
@@ -2878,7 +3092,11 @@ def virtual_bank_html(
             chips.append(
                 (
                     f'<div class="{" ".join(classes)}" '
-                    f'style="left:{left:.1f}%; top:{top:.1f}%; --line-color:{color};">'
+                    f'style="left:{left:.1f}%; top:{top:.1f}%; '
+                    f'--line-color:{line_color}; '
+                    f'--car-color:{car_color["background"]}; '
+                    f'--car-text-color:{car_color["text"]}; '
+                    f'--car-border-color:{car_color["border"]};">'
                     f"{rank_html}"
                     f'<span class="rider-no">{int(number)}</span>'
                     f"<strong>{html.escape(f'ライン{line_index + 1}')}</strong>"
@@ -2909,6 +3127,39 @@ def render_virtual_bank(
         st.info("ライン構成を入力すると仮想バンクを表示します。")
         return
     st.markdown(bank_html, unsafe_allow_html=True)
+
+
+def render_interactive_lineup_board(
+    race_id: int,
+    line_groups: tuple[tuple[int, ...], ...],
+    active_index: int,
+    projected_top3: tuple[int, ...],
+    names: dict[int, str],
+) -> None:
+    positions_key = f"development_board_positions_{race_id}"
+    saved_positions = st.session_state.get(positions_key, {})
+    valid_car_numbers = flatten_line_groups(line_groups)
+    saved_positions = normalize_board_positions(saved_positions, valid_car_numbers)
+    pieces = lineup_board_pieces(line_groups, active_index, projected_top3, names, saved_positions)
+    if not pieces:
+        render_virtual_bank(line_groups, active_index, projected_top3, names)
+        return
+
+    value = LINEUP_BOARD_COMPONENT(
+        pieces=pieces,
+        line_summary=format_line_groups(line_groups),
+        active_line=f"ライン{active_index + 1}",
+        projected_top3=list(projected_top3),
+        key=f"development_lineup_board_{race_id}",
+        default=None,
+    )
+    if not isinstance(value, dict):
+        return
+
+    next_positions = normalize_board_positions(value.get("positions", {}), valid_car_numbers)
+    if next_positions and next_positions != saved_positions:
+        st.session_state[positions_key] = next_positions
+        st.rerun()
 
 
 def development_note_text(
@@ -4123,9 +4374,29 @@ def render_riders(selected_race_id: int | None) -> None:
         )
 
 
-def render_development_forecast(selected_race_id: int | None) -> None:
-    if not selected_race_id:
+def render_development_forecast(selected_race_id: int | None, races: pd.DataFrame | None = None) -> None:
+    races = races if races is not None else fetch_races()
+    if races.empty:
         render_header(None)
+        st.subheader("展開予想")
+        st.info("先にレースを登録してください。")
+        return
+
+    if not selected_race_id:
+        selected_race_id = int(sort_latest_races(races).iloc[0]["id"])
+        st.session_state["selected_race_id"] = selected_race_id
+
+    selected_race = fetch_race(selected_race_id)
+    render_header(selected_race)
+    st.subheader("展開予想")
+
+    selected_race_id = render_page_race_selector(
+        races,
+        selected_race_id,
+        label="展開予想で見るレース",
+        key_prefix="development_forecast",
+    )
+    if not selected_race_id:
         st.info("先にレースを登録してください。")
         return
 
@@ -4138,6 +4409,7 @@ def render_development_forecast(selected_race_id: int | None) -> None:
     active_key = f"development_active_index_{selected_race_id}"
     scenario_key = f"development_scenario_{selected_race_id}"
     message_key = f"development_sync_message_{selected_race_id}"
+    positions_key = f"development_board_positions_{selected_race_id}"
 
     if input_key not in st.session_state:
         st.session_state[input_key] = format_line_groups(default_groups)
@@ -4150,9 +4422,6 @@ def render_development_forecast(selected_race_id: int | None) -> None:
         st.session_state[input_key] = format_line_groups(default_groups)
         st.session_state[groups_key] = default_groups
         st.session_state[active_key] = 0
-
-    render_header(selected_race)
-    st.subheader("展開予想")
 
     sync_message = st.session_state.pop(message_key, None)
     if sync_message:
@@ -4178,6 +4447,7 @@ def render_development_forecast(selected_race_id: int | None) -> None:
                         st.session_state[input_key] = format_line_groups(refreshed_groups)
                         st.session_state[groups_key] = refreshed_groups
                         st.session_state[active_key] = 0
+                        st.session_state.pop(positions_key, None)
                         st.session_state[message_key] = {
                             "level": "success",
                             "text": f"補完完了: 選手{len(source.riders)}名 / ライン{len(refreshed_groups)}件。展開予想へ反映しました。",
@@ -4198,6 +4468,7 @@ def render_development_forecast(selected_race_id: int | None) -> None:
         st.session_state[input_key] = format_line_groups(default_groups)
         st.session_state[groups_key] = default_groups
         st.session_state[active_key] = 0
+        st.session_state.pop(positions_key, None)
         st.rerun()
     col_input.text_input("ライン構成", key=input_key, placeholder="例: 123ー456ー789 / 1-2-3 ・ 4-5")
     if col_apply.button("反映", use_container_width=True):
@@ -4207,6 +4478,7 @@ def render_development_forecast(selected_race_id: int | None) -> None:
         else:
             st.session_state[groups_key] = parsed_groups
             st.session_state[active_key] = 0
+            st.session_state.pop(positions_key, None)
             st.rerun()
 
     line_groups = normalize_line_groups(tuple(tuple(group) for group in st.session_state.get(groups_key, ())))
@@ -4229,22 +4501,27 @@ def render_development_forecast(selected_race_id: int | None) -> None:
     if col_front.button("先頭へ", use_container_width=True, disabled=active_index == 0):
         st.session_state[groups_key] = move_line_group(line_groups, active_index, 0)
         st.session_state[active_key] = 0
+        st.session_state.pop(positions_key, None)
         st.rerun()
     if col_prev.button("一つ前へ", use_container_width=True, disabled=active_index == 0):
         st.session_state[groups_key] = move_line_group(line_groups, active_index, active_index - 1)
         st.session_state[active_key] = active_index - 1
+        st.session_state.pop(positions_key, None)
         st.rerun()
     if col_next.button("一つ後ろへ", use_container_width=True, disabled=active_index >= len(line_groups) - 1):
         st.session_state[groups_key] = move_line_group(line_groups, active_index, active_index + 1)
         st.session_state[active_key] = active_index + 1
+        st.session_state.pop(positions_key, None)
         st.rerun()
     if col_back.button("最後尾へ", use_container_width=True, disabled=active_index >= len(line_groups) - 1):
         st.session_state[groups_key] = move_line_group(line_groups, active_index, len(line_groups) - 1)
         st.session_state[active_key] = len(line_groups) - 1
+        st.session_state.pop(positions_key, None)
         st.rerun()
     if col_reverse.button("隊列反転", use_container_width=True):
         st.session_state[groups_key] = tuple(reversed(line_groups))
         st.session_state[active_key] = len(line_groups) - 1 - active_index
+        st.session_state.pop(positions_key, None)
         st.rerun()
 
     scenario_options = scenario_options_for_group(active_group)
@@ -4256,7 +4533,7 @@ def render_development_forecast(selected_race_id: int | None) -> None:
 
     bank_col, probability_col = st.columns([2, 1])
     with bank_col:
-        render_virtual_bank(line_groups, active_index, projected_top3, names)
+        render_interactive_lineup_board(selected_race_id, line_groups, active_index, projected_top3, names)
     with probability_col:
         st.markdown("#### 過去目安")
         st.metric(
@@ -4644,6 +4921,7 @@ def render_review(selected_race_id: int | None) -> None:
 def main() -> None:
     st.set_page_config(page_title="zenKeirin Lab", page_icon="K", layout="wide")
     apply_style()
+    require_app_password()
     init_db()
     refresh_public_statuses(date.today().isoformat())
     today_sync_result = sync_today_winticket_races_once()
@@ -4660,7 +4938,7 @@ def main() -> None:
     elif page == "選手評価":
         render_riders(selected_race_id)
     elif page == "展開予想":
-        render_development_forecast(selected_race_id)
+        render_development_forecast(selected_race_id, races)
     elif page == "買い目・結果":
         render_bets_and_results(selected_race_id)
     elif page == "振り返り":

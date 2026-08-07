@@ -1,6 +1,8 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -21,6 +23,14 @@ class AppCompletionTest(unittest.TestCase):
         app.DATA_DIR = self.original_data_dir
         app.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
+
+    def test_configured_db_path_uses_environment_override(self):
+        with patch.dict(os.environ, {"ZEN_KEIRIN_DB_PATH": "/tmp/zen-keirin-test.sqlite3"}):
+            self.assertEqual(app.configured_db_path(), Path("/tmp/zen-keirin-test.sqlite3"))
+
+    def test_configured_app_password_prefers_environment(self):
+        with patch.dict(os.environ, {"ZEN_KEIRIN_APP_PASSWORD": "outside-password"}):
+            self.assertEqual(app.configured_app_password(), "outside-password")
 
     def test_amount_labels_separate_yen_and_tip_medals(self):
         self.assertEqual(app.net_label("円"), "円収支")
@@ -612,7 +622,56 @@ class AppCompletionTest(unittest.TestCase):
 
         self.assertTrue(html.startswith('<div class="virtual-bank">'))
         self.assertIn('class="rider-chip is-active is-projected"', html)
+        self.assertIn("--car-color:#f8fafc", html)
+        self.assertIn("--car-color:#dc2626", html)
         self.assertNotIn("\n    <div", html)
+
+    def test_lineup_board_pieces_keep_car_colors_ranks_and_positions(self):
+        pieces = app.lineup_board_pieces(
+            ((1, 2), (3,)),
+            0,
+            (2, 1, 3),
+            {1: "山崎賢人", 2: "小川勇介", 3: "山岸佳太"},
+            {"2": {"x": 101, "y": -5}, "3": {"x": "40.4", "y": "51.6"}},
+        )
+
+        piece_by_car = {piece["carNo"]: piece for piece in pieces}
+        self.assertEqual(piece_by_car[1]["carColorName"], "白")
+        self.assertEqual(piece_by_car[1]["carColor"], app.CAR_NUMBER_COLORS[1]["background"])
+        self.assertEqual(piece_by_car[2]["carColorName"], "黒")
+        self.assertEqual(piece_by_car[3]["carColorName"], "赤")
+        self.assertEqual(piece_by_car[3]["lineColor"], app.BANK_LINE_COLORS[1])
+        self.assertTrue(piece_by_car[1]["isActive"])
+        self.assertFalse(piece_by_car[3]["isActive"])
+        self.assertEqual(piece_by_car[2]["projectedRank"], 1)
+        self.assertEqual(piece_by_car[1]["projectedRank"], 2)
+        self.assertEqual(piece_by_car[3]["linePosition"], "単騎")
+        self.assertEqual(piece_by_car[2]["x"], 96.0)
+        self.assertEqual(piece_by_car[2]["y"], 4.0)
+        self.assertEqual(piece_by_car[3]["x"], 40.4)
+        self.assertEqual(piece_by_car[3]["y"], 51.6)
+
+    def test_normalize_board_positions_accepts_component_payload(self):
+        positions = app.normalize_board_positions(
+            {
+                "1": {"x": -20, "y": 120},
+                "car-2": {"x": "nan", "y": 30},
+                "9": {"x": 50, "y": 50},
+            },
+            (1, 2),
+        )
+
+        self.assertEqual(positions["1"], {"x": 4.0, "y": 96.0})
+        self.assertEqual(positions["2"], {"x": 50.0, "y": 30.0})
+        self.assertNotIn("9", positions)
+
+    def test_lineup_board_component_has_streamlit_protocol(self):
+        component_html = Path(app.APP_DIR) / "components" / "lineup_board" / "index.html"
+        content = component_html.read_text(encoding="utf-8")
+
+        self.assertIn("streamlit:setComponentValue", content)
+        self.assertIn("data-piece-id", content)
+        self.assertIn("配置リセット", content)
 
     def test_prerace_reference_builds_line_and_scenario_candidates(self):
         riders = pd.DataFrame(

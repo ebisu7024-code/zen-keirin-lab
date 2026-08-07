@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: zen-keirin-lab
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    disk:
+      name: zen-keirin-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.11
+      - key: ZEN_KEIRIN_DB_PATH
+        value: /var/data/zen_keirin_lab.sqlite3
+      - key: ZEN_KEIRIN_APP_PASSWORD
+        sync: false

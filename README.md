@@ -25,6 +25,12 @@ streamlit run app.py
 
 SQLiteのデータは `data/zen_keirin_lab.sqlite3` に保存されます。
 
+## 外出先で使う
+
+推奨は Render Web Service + Persistent Disk です。`render.yaml` を用意してあり、公開時は `ZEN_KEIRIN_APP_PASSWORD` を設定すると簡易パスワード画面が有効になります。
+
+詳しい手順は [docs/deployment.md](docs/deployment.md) を参照してください。
+
 ## 方針
 
 このアプリは利益や的中を保証するものではありません。能力評価、展開評価、心理・関係性評価を分けて保存し、予想後に「どの判断が効いたか」を検証するための研究ノートとして使います。
