@@ -10,6 +10,7 @@ import sqlite3
 import re
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
@@ -43,6 +44,7 @@ fetch_winticket_race_listings = winticket_source_module.fetch_winticket_race_lis
 
 
 APP_DIR = Path(__file__).resolve().parent
+APP_TIME_ZONE = ZoneInfo("Asia/Tokyo")
 
 
 def configured_db_path() -> Path:
@@ -166,8 +168,20 @@ def require_app_password() -> None:
     st.stop()
 
 
+def app_now() -> datetime:
+    return datetime.now(APP_TIME_ZONE)
+
+
+def app_today() -> date:
+    return app_now().date()
+
+
+def app_today_text() -> str:
+    return app_today().isoformat()
+
+
 def now_text() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return app_now().replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -476,7 +490,7 @@ def restore_database(uploaded_file) -> dict[str, int]:
     if DB_PATH.exists():
         backup_dir = DATA_DIR / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_name = f"{DB_PATH.stem}.{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak{DB_PATH.suffix}"
+        backup_name = f"{DB_PATH.stem}.{app_now().strftime('%Y%m%d-%H%M%S')}.bak{DB_PATH.suffix}"
         shutil.copy2(DB_PATH, backup_dir / backup_name)
 
     os.replace(upload_path, DB_PATH)
@@ -604,7 +618,7 @@ def has_passed_race_close(race_date: str | None, close_time: str | None) -> bool
         close_at = datetime.strptime(f"{race_date_text} {close_text}", "%Y-%m-%d %H:%M")
     except ValueError:
         return False
-    return datetime.now() >= close_at
+    return app_now().replace(tzinfo=None) >= close_at
 
 
 def status_after_public_sync(current_status: str | None, race_date: str | None, close_time: str | None, has_result: bool) -> str:
@@ -2011,7 +2025,7 @@ def sync_winticket_race_list_for_date(
     hydrate: bool = False,
     hydrate_limit: int | None = None,
 ) -> dict:
-    target = target_date or date.today()
+    target = target_date or app_today()
     target_text = target.isoformat() if isinstance(target, date) else str(target)
     listings = fetch_winticket_race_listings(target_text, fetcher=fetcher)
     created = 0
@@ -2038,7 +2052,7 @@ def sync_winticket_race_list_for_date(
 
 
 def sync_today_winticket_races_once() -> dict | None:
-    today_text = date.today().isoformat()
+    today_text = app_today_text()
     session_key = f"winticket_today_synced_{today_text}_{TODAY_SYNC_VERSION}"
     if st.session_state.get(session_key):
         return st.session_state.get("winticket_today_sync_result")
@@ -2112,7 +2126,7 @@ def seed_demo_data() -> None:
     race_id = upsert_race(
         None,
         {
-            "race_date": date.today().isoformat(),
+            "race_date": app_today_text(),
             "venue": "小田原",
             "race_no": 9,
             "grade": "F1",
@@ -3329,31 +3343,36 @@ def display_queue_table(df: pd.DataFrame, *, key: str, empty_message: str, targe
 
 
 def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> None:
-    today_text = date.today().isoformat()
     st.subheader("本日開催")
+    target_date = st.date_input("開催日", value=app_today(), key="race_list_date")
+    target_text = target_date.isoformat() if isinstance(target_date, date) else app_today_text()
+    is_today = target_text == app_today_text()
+    target_label = "本日" if is_today else target_text
+    visible_sync_result = sync_result if sync_result and sync_result.get("race_date") == target_text else None
+
     col_info, col_action = st.columns([3, 1])
     with col_info:
-        if sync_result and sync_result.get("error"):
-            st.warning(f"{today_text} のWINTICKET開催一覧を更新できませんでした: {sync_result['error']}")
-        elif sync_result:
-            details = sync_result.get("details") or {}
+        if visible_sync_result and visible_sync_result.get("error"):
+            st.warning(f"{target_text} のWINTICKET開催一覧を更新できませんでした: {visible_sync_result['error']}")
+        elif visible_sync_result:
+            details = visible_sync_result.get("details") or {}
             detail_text = ""
             if details:
                 detail_text = f" / 補完{len(details.get('synced', []))}件 / 失敗{len(details.get('failed', []))}件"
             st.caption(
-                f"{sync_result['race_date']} 更新: 取得{sync_result['fetched']}件 / "
-                f"新規{sync_result['created']}件 / 更新{sync_result['updated']}件{detail_text}"
+                f"{visible_sync_result['race_date']} 更新: 取得{visible_sync_result['fetched']}件 / "
+                f"新規{visible_sync_result['created']}件 / 更新{visible_sync_result['updated']}件{detail_text}"
             )
         else:
-            st.caption("アプリ起動・再読み込み時にWINTICKET開催一覧を確認します。")
+            st.caption(f"{target_label}のWINTICKET開催一覧を確認できます。")
     with col_action:
-        if st.button("本日開催を更新", use_container_width=True):
-            with st.spinner("WINTICKETの本日開催を更新しています..."):
+        if st.button(f"{target_label}開催を更新", use_container_width=True):
+            with st.spinner(f"WINTICKETの{target_label}開催を更新しています..."):
                 try:
-                    result = sync_winticket_race_list_for_date(today_text)
+                    result = sync_winticket_race_list_for_date(target_text)
                 except Exception as exc:
                     st.session_state["winticket_today_sync_result"] = {
-                        "race_date": today_text,
+                        "race_date": target_text,
                         "error": str(exc),
                         "fetched": 0,
                         "created": 0,
@@ -3370,16 +3389,16 @@ def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> N
                 st.rerun()
 
     if races.empty:
-        st.info("本日開催の登録レースはまだありません。")
+        st.info(f"{target_label}開催の登録レースはまだありません。")
         return
 
-    today_races = sort_latest_races(races[races["race_date"] == today_text])
+    today_races = sort_latest_races(races[races["race_date"] == target_text])
     if today_races.empty:
-        st.info("本日開催の登録レースはまだありません。更新ボタンでWINTICKETから取得できます。")
+        st.info(f"{target_label}開催の登録レースはまだありません。更新ボタンでWINTICKETから取得できます。")
         return
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("本日レース", f"{len(today_races)}")
+    col1.metric(f"{target_label}レース", f"{len(today_races)}")
     col2.metric("未買い目", f"{int((today_races['bet_count'].fillna(0).astype(int) == 0).sum())}")
     col3.metric("理由なし", f"{int((today_races['missing_bet_reason_count'].fillna(0).astype(int) > 0).sum())}")
     col4.metric("未振り返り", f"{int((today_races['review_done'].fillna(0).astype(int) == 0).sum())}")
@@ -3400,10 +3419,10 @@ def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> N
     default_select_index = today_ids.index(selected_state_id) if selected_state_id in today_ids else 0
     col_select, col_open, col_hydrate = st.columns([3, 1, 1])
     selected_today_label = col_select.selectbox(
-        "本日開催からレースを選択",
+        f"{target_label}開催からレースを選択",
         select_labels,
         index=default_select_index,
-        key="today_race_selector",
+        key=f"today_race_selector_{target_text}",
     )
     selected_today_id = today_ids[select_labels.index(selected_today_label)]
     if col_open.button("選択レースを開く", use_container_width=True):
@@ -3424,11 +3443,11 @@ def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> N
 
     col_batch_count, col_batch_run = st.columns([1, 3])
     batch_limit = col_batch_count.selectbox("随時補完", [3, 5, 10, 20], index=1, key="today_batch_hydrate_limit")
-    if col_batch_run.button("本日未補完を少し補完", use_container_width=True):
-        with st.spinner(f"本日未補完レースを{int(batch_limit)}件まで補完しています..."):
+    if col_batch_run.button(f"{target_label}未補完を少し補完", use_container_width=True):
+        with st.spinner(f"{target_label}未補完レースを{int(batch_limit)}件まで補完しています..."):
             result = sync_winticket_details_for_race_ids(today_ids, limit=int(batch_limit))
         st.session_state["winticket_today_sync_result"] = {
-            "race_date": today_text,
+            "race_date": target_text,
             "fetched": len(today_ids),
             "created": 0,
             "updated": len(today_ids),
@@ -3472,7 +3491,7 @@ def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> N
             }
         ),
         key="today_races_table",
-        empty_message="本日開催の登録レースはありません。",
+        empty_message=f"{target_label}開催の登録レースはありません。",
     )
 
 
@@ -4243,7 +4262,7 @@ def render_race_form(selected_race_id: int | None) -> None:
     render_header(selected_race)
     st.subheader("レース登録")
 
-    default_date = date.today()
+    default_date = app_today()
     if selected_race.get("race_date"):
         default_date = date.fromisoformat(selected_race["race_date"])
 
@@ -5043,7 +5062,7 @@ def main() -> None:
     apply_style()
     require_app_password()
     init_db()
-    refresh_public_statuses(date.today().isoformat())
+    refresh_public_statuses(app_today_text())
     today_sync_result = sync_today_winticket_races_once()
     races = fetch_races()
     selected_race_id = sidebar_select_race(races)

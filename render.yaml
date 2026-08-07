@@ -8,5 +8,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.11
+      - key: TZ
+        value: Asia/Tokyo
       - key: ZEN_KEIRIN_APP_PASSWORD
         sync: false
