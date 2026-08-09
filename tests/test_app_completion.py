@@ -32,6 +32,52 @@ class AppCompletionTest(unittest.TestCase):
         with patch.dict(os.environ, {"ZEN_KEIRIN_APP_PASSWORD": "outside-password"}):
             self.assertEqual(app.configured_app_password(), "outside-password")
 
+    def test_startup_sync_hydrate_limit_uses_environment_override(self):
+        with patch.dict(os.environ, {"ZEN_KEIRIN_STARTUP_HYDRATE_LIMIT": "0"}):
+            self.assertEqual(app.startup_sync_hydrate_limit(), 0)
+        with patch.dict(os.environ, {"ZEN_KEIRIN_STARTUP_HYDRATE_LIMIT": "invalid"}):
+            self.assertEqual(app.startup_sync_hydrate_limit(), app.STARTUP_SYNC_HYDRATE_LIMIT)
+
+    def test_upsert_race_keeps_tipstar_result_url_reference(self):
+        tipstar_url = "https://tipstar.com/order/result?raceType=keirin&raceId=2026-07-26_23_03"
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-26",
+                "venue": "取手",
+                "race_no": 3,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "TIPメダル",
+                "status": "購入済み",
+                "race_title": "",
+                "source_ref": tipstar_url,
+                "line_summary": "",
+                "race_memo": "",
+            },
+        )
+
+        saved = app.fetch_race(race_id)
+        self.assertEqual(saved["source_race_id"], "2026-07-26_23_03")
+        self.assertEqual(saved["source_result_url"], tipstar_url)
+        self.assertEqual(saved["source_status"], "TIPSTAR参照")
+
+    def test_source_links_markdown_separates_tipstar_and_winticket_links(self):
+        tipstar_url = "https://tipstar.com/order/result?raceType=keirin&raceId=2026-07-26_23_03"
+        racecard_url = "https://www.winticket.jp/keirin/toride/racecard/2026072623/1/3"
+        links = app.source_links_markdown(
+            {
+                "source_racecard_url": racecard_url,
+                "source_result_url": tipstar_url,
+            }
+        )
+
+        self.assertIn("[WINTICKET出走表]", links)
+        self.assertIn(racecard_url.replace("/racecard/", "/raceresult/"), links)
+        self.assertIn("[TIPSTAR購入結果]", links)
+
     def test_amount_labels_separate_yen_and_tip_medals(self):
         self.assertEqual(app.net_label("円"), "円収支")
         self.assertEqual(app.net_label("TIPメダル"), "メダル差分")
@@ -442,6 +488,89 @@ class AppCompletionTest(unittest.TestCase):
         self.assertEqual(saved["status"], "結果入力済み")
         self.assertEqual(saved["source_status"], "TIPSTAR取込")
         self.assertEqual(saved["source_result_url"], tipstar_url)
+
+    def test_sync_winticket_for_race_uses_winticket_result_when_tipstar_url_is_reference(self):
+        racecard_url = "https://www.winticket.jp/keirin/toride/racecard/2026072623/1/3"
+        winticket_result_url = racecard_url.replace("/racecard/", "/raceresult/")
+        tipstar_url = "https://tipstar.com/order/result?raceType=keirin&raceId=2026-07-26_23_03"
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-26",
+                "venue": "取手",
+                "race_no": 3,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "TIPメダル",
+                "status": "購入済み",
+                "race_title": "",
+                "source_ref": tipstar_url,
+                "line_summary": "",
+                "race_memo": "",
+            },
+        )
+        with app.get_conn() as conn:
+            conn.execute(
+                "UPDATE races SET source_racecard_url = ? WHERE id = ?",
+                (racecard_url, race_id),
+            )
+
+        fetched_urls = []
+
+        def fake_fetcher(url):
+            fetched_urls.append(url)
+            if url == racecard_url:
+                return """
+                A級チ一般
+                発走 10:59 締切 10:54
+                2026年7月26日 1,625m (4周) 曇34.0℃北北西1.0m/s
+                枠 車
+                選手名
+                1
+                1
+                山田太郎 東京 A1 30歳 100期
+                80.00
+                3.92 自力。
+                2
+                2
+                佐藤次郎 神奈川 A1 31歳 101期
+                79.00
+                3.92 山田君。
+                並び予想
+                1
+                2
+                結果
+                """
+            if url == winticket_result_url:
+                return """
+                並び予想
+                1
+                2
+                着順 ビデオ 映像を観る
+                着 車 選手名 着差 上り 決 SB
+                1
+                1
+                山田太郎 東京 A1 30歳 100期
+                11.6 逃 B
+                2
+                2
+                佐藤次郎 神奈川 A1 31歳 101期
+                1車輪 11.5
+                払戻金
+                賭け式 払戻金 人気
+                2車単 1-2 300 円(1)
+                """
+            raise AssertionError(f"unexpected url: {url}")
+
+        source = app.sync_winticket_for_race(race_id, fetcher=fake_fetcher)
+
+        self.assertEqual(fetched_urls, [racecard_url, winticket_result_url])
+        self.assertEqual(len(source.result_rows), 2)
+        saved = app.fetch_race(race_id)
+        self.assertEqual(saved["source_result_url"], tipstar_url)
+        self.assertEqual(saved["source_status"], "補完済み")
 
     def test_sync_winticket_race_list_can_hydrate_details_and_mark_finished(self):
         racecard_url = "https://www.winticket.jp/keirin/wakayama/racecard/2026072455/3/1"

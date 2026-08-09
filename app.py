@@ -114,7 +114,10 @@ CAR_NUMBER_COLORS = {
 }
 TIP_MEDAL_DAILY_GRANT = 10000
 TIP_MEDAL_RESET_TEXT = "翌日3:00"
-TODAY_SYNC_VERSION = "racecard-index-v4"
+TODAY_SYNC_VERSION = "startup-latest-v1"
+STARTUP_SYNC_HYDRATE_LIMIT = 5
+TIPSTAR_ORDER_RESULT_URL = "https://tipstar.com/order/result"
+TIPSTAR_REFERENCE_STATUS = "TIPSTAR参照"
 ADJUSTMENT_SOURCE_STATUSES = {"TIPSTAR年次差額調整"}
 REQUIRED_DB_TABLES = (
     "races",
@@ -182,6 +185,87 @@ def app_today_text() -> str:
 
 def now_text() -> str:
     return app_now().replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def startup_sync_hydrate_limit() -> int:
+    raw_value = os.environ.get("ZEN_KEIRIN_STARTUP_HYDRATE_LIMIT", "").strip()
+    if not raw_value:
+        return STARTUP_SYNC_HYDRATE_LIMIT
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return STARTUP_SYNC_HYDRATE_LIMIT
+
+
+def first_url_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"https?://[^\s]+", text)
+    return (match.group(0) if match else text).rstrip("。、,")
+
+
+def is_tipstar_order_result_url(value: str | None) -> bool:
+    return first_url_text(value).startswith(TIPSTAR_ORDER_RESULT_URL)
+
+
+def is_winticket_url(value: str | None) -> bool:
+    return "winticket.jp" in first_url_text(value)
+
+
+def winticket_result_url_from_racecard_url(value: str | None) -> str:
+    url = first_url_text(value).split("?")[0].rstrip("/")
+    if "/racecard/" not in url:
+        return ""
+    return url.replace("/racecard/", "/raceresult/")
+
+
+def source_urls_from_ref(source_ref: str | None) -> dict[str, str]:
+    url = first_url_text(source_ref)
+    if not url:
+        return {}
+    clean_url = url.split("#")[0].split("?")[0].rstrip("/")
+    if is_tipstar_order_result_url(url):
+        return {"source_result_url": url, "source_status": TIPSTAR_REFERENCE_STATUS}
+    if not is_winticket_url(url):
+        return {}
+    if "/racecard/" in clean_url:
+        return {
+            "source_racecard_url": clean_url,
+            "source_result_url": winticket_result_url_from_racecard_url(clean_url),
+        }
+    if "/raceresult/" in clean_url:
+        return {
+            "source_racecard_url": clean_url.replace("/raceresult/", "/racecard/"),
+            "source_result_url": clean_url,
+        }
+    return {}
+
+
+def winticket_result_url_for_race(race: dict | pd.Series | None) -> str:
+    if race is None:
+        return ""
+    result_url = str(race.get("source_result_url", "") if hasattr(race, "get") else "").strip()
+    if is_winticket_url(result_url):
+        return result_url
+    racecard_url = str(race.get("source_racecard_url", "") if hasattr(race, "get") else "").strip()
+    return winticket_result_url_from_racecard_url(racecard_url)
+
+
+def source_links_markdown(race: dict | pd.Series | None) -> str:
+    if race is None:
+        return ""
+    racecard_url = str(race.get("source_racecard_url", "") if hasattr(race, "get") else "").strip()
+    result_url = str(race.get("source_result_url", "") if hasattr(race, "get") else "").strip()
+    links: list[str] = []
+    if racecard_url:
+        links.append(f"[WINTICKET出走表]({racecard_url})")
+    winticket_result_url = winticket_result_url_for_race(race)
+    if winticket_result_url:
+        links.append(f"[WINTICKET結果]({winticket_result_url})")
+    if is_tipstar_order_result_url(result_url):
+        links.append(f"[TIPSTAR購入結果]({result_url})")
+    return " / ".join(links)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -638,6 +722,29 @@ def source_status_after_public_sync(current_source_status: str | None, incoming_
     if current in {"TIPSTAR取込", "補完済み"}:
         return current
     return incoming or current
+
+
+def apply_source_ref_urls(conn: sqlite3.Connection, race_id: int, source_urls: dict[str, str]) -> None:
+    updates: list[str] = []
+    values: list[str | int] = []
+    if source_urls.get("source_racecard_url"):
+        updates.append("source_racecard_url = ?")
+        values.append(source_urls["source_racecard_url"])
+    if source_urls.get("source_result_url"):
+        updates.append("source_result_url = ?")
+        values.append(source_urls["source_result_url"])
+    if source_urls.get("source_status"):
+        row = conn.execute("SELECT source_status FROM races WHERE id = ?", (race_id,)).fetchone()
+        updates.append("source_status = ?")
+        values.append(source_status_after_public_sync(row["source_status"] if row else "", source_urls["source_status"]))
+    if not updates:
+        return
+    updates.append("updated_at = ?")
+    values.append(now_text())
+    conn.execute(
+        f"UPDATE races SET {', '.join(updates)} WHERE id = ?",
+        (*values, race_id),
+    )
 
 
 def refresh_public_statuses(target_date: str | None = None) -> None:
@@ -1340,6 +1447,7 @@ def upsert_race(race_id: int | None, payload: dict) -> int:
     ]
     values = [payload.get(field, "") for field in fields]
     source_race_id = extract_source_race_id(payload.get("source_ref", "")) or extract_source_race_id(payload.get("race_memo", ""))
+    source_urls = source_urls_from_ref(payload.get("source_ref", ""))
     line_summary = payload.get("line_summary", "").strip()
     with get_conn() as conn:
         if race_id:
@@ -1353,6 +1461,7 @@ def upsert_race(race_id: int | None, payload: dict) -> int:
                     "UPDATE races SET source_race_id = ?, updated_at = ? WHERE id = ?",
                     (source_race_id, timestamp, race_id),
                 )
+            apply_source_ref_urls(conn, int(race_id), source_urls)
             saved_id = race_id
         else:
             cursor = conn.execute(
@@ -1365,6 +1474,7 @@ def upsert_race(race_id: int | None, payload: dict) -> int:
             saved_id = int(cursor.lastrowid)
             if source_race_id:
                 conn.execute("UPDATE races SET source_race_id = ? WHERE id = ?", (source_race_id, saved_id))
+            apply_source_ref_urls(conn, saved_id, source_urls)
 
         if line_summary:
             result = conn.execute("SELECT first_no, second_no, third_no FROM results WHERE race_id = ?", (saved_id,)).fetchone()
@@ -1738,7 +1848,10 @@ def apply_winticket_source(race_id: int, source) -> None:
     timestamp = now_text()
     result_numbers = tuple(row.car_no for row in source.result_rows[:3])
     with get_conn() as conn:
-        race = conn.execute("SELECT race_date, status, close_time, source_status FROM races WHERE id = ?", (race_id,)).fetchone()
+        race = conn.execute(
+            "SELECT race_date, status, close_time, source_status, source_result_url FROM races WHERE id = ?",
+            (race_id,),
+        ).fetchone()
         synced_status = status_after_public_sync(
             race["status"] if race else "",
             race["race_date"] if race else "",
@@ -1746,12 +1859,13 @@ def apply_winticket_source(race_id: int, source) -> None:
             bool(result_numbers),
         )
         synced_source_status = source_status_after_public_sync(race["source_status"] if race else "", "補完済み")
+        preserve_tipstar_result_url = is_tipstar_order_result_url(race["source_result_url"] if race else "")
         conn.execute(
             """
             UPDATE races
             SET source_race_id = CASE WHEN COALESCE(source_race_id, '') = '' THEN ? ELSE source_race_id END,
                 source_racecard_url = ?,
-                source_result_url = CASE WHEN ? = 'TIPSTAR取込' AND COALESCE(source_result_url, '') <> '' THEN source_result_url ELSE ? END,
+                source_result_url = CASE WHEN ? THEN source_result_url ELSE ? END,
                 source_synced_at = ?,
                 source_status = ?,
                 status = ?,
@@ -1768,7 +1882,7 @@ def apply_winticket_source(race_id: int, source) -> None:
             (
                 source.source_race_id,
                 source.racecard_url,
-                synced_source_status,
+                int(preserve_tipstar_result_url),
                 source.result_url,
                 timestamp,
                 synced_source_status,
@@ -1843,7 +1957,7 @@ def sync_winticket_for_race(race_id: int, fetcher=None):
         source = fetch_winticket_race_by_urls(
             source_race_id=source_race_id,
             racecard_url=race["source_racecard_url"],
-            result_url=race.get("source_result_url", ""),
+            result_url=winticket_result_url_for_race(race),
             fetcher=fetcher or winticket_source_module.fetch_url,
         )
     else:
@@ -1867,13 +1981,13 @@ def upsert_winticket_race_listing(listing) -> tuple[int, bool]:
         existing = None
         if listing.source_race_id:
             existing = conn.execute(
-                "SELECT id, status, source_status FROM races WHERE source_race_id = ? ORDER BY id LIMIT 1",
+                "SELECT id, status, source_status, source_result_url FROM races WHERE source_race_id = ? ORDER BY id LIMIT 1",
                 (listing.source_race_id,),
             ).fetchone()
         if not existing:
             existing = conn.execute(
                 """
-                SELECT id, status, source_status
+                SELECT id, status, source_status, source_result_url
                 FROM races
                 WHERE race_date = ? AND venue = ? AND race_no = ?
                 ORDER BY id
@@ -1886,13 +2000,14 @@ def upsert_winticket_race_listing(listing) -> tuple[int, bool]:
             race_id = int(existing["id"])
             listing_status = status_after_public_sync(existing["status"], listing.race_date, listing.close_time, False)
             listing_source_status = source_status_after_public_sync(existing["source_status"], listing.source_status)
+            preserve_tipstar_result_url = is_tipstar_order_result_url(existing["source_result_url"])
             conn.execute(
                 """
                 UPDATE races
                 SET source_race_id = CASE WHEN COALESCE(source_race_id, '') = '' THEN ? ELSE source_race_id END,
                     source_racecard_url = CASE WHEN ? <> '' THEN ? ELSE source_racecard_url END,
                     source_result_url = CASE
-                        WHEN COALESCE(source_status, '') = 'TIPSTAR取込' AND COALESCE(source_result_url, '') <> '' THEN source_result_url
+                        WHEN ? THEN source_result_url
                         WHEN ? <> '' THEN ?
                         ELSE source_result_url
                     END,
@@ -1910,6 +2025,7 @@ def upsert_winticket_race_listing(listing) -> tuple[int, bool]:
                     listing.source_race_id,
                     racecard_url,
                     racecard_url,
+                    int(preserve_tipstar_result_url),
                     result_url,
                     result_url,
                     timestamp,
@@ -2056,10 +2172,17 @@ def sync_today_winticket_races_once() -> dict | None:
     session_key = f"winticket_today_synced_{today_text}_{TODAY_SYNC_VERSION}"
     if st.session_state.get(session_key):
         return st.session_state.get("winticket_today_sync_result")
+    hydrate_limit = startup_sync_hydrate_limit()
     try:
-        result = sync_winticket_race_list_for_date(today_text)
+        result = sync_winticket_race_list_for_date(
+            today_text,
+            hydrate=hydrate_limit > 0,
+            hydrate_limit=hydrate_limit if hydrate_limit > 0 else None,
+        )
     except Exception as exc:
         result = {"race_date": today_text, "error": str(exc), "fetched": 0, "created": 0, "updated": 0}
+    else:
+        result["startup_hydrate_limit"] = hydrate_limit
     st.session_state[session_key] = True
     st.session_state["winticket_today_sync_result"] = result
     return result
@@ -3365,6 +3488,7 @@ def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> N
             )
         else:
             st.caption(f"{target_label}のWINTICKET開催一覧を確認できます。")
+        st.markdown(f"[TIPSTAR購入結果]({TIPSTAR_ORDER_RESULT_URL})")
     with col_action:
         if st.button(f"{target_label}開催を更新", use_container_width=True):
             with st.spinner(f"WINTICKETの{target_label}開催を更新しています..."):
@@ -3601,8 +3725,9 @@ def render_selected_race_research(selected_race_id: int | None) -> None:
     names = rider_name_map(selected_race_id)
 
     st.markdown(f"#### {race_label(race)}")
-    if race.get("source_racecard_url"):
-        st.markdown(f"[WINTICKET出走表]({race['source_racecard_url']}) / [WINTICKET結果]({race['source_result_url']})")
+    source_links = source_links_markdown(race)
+    if source_links:
+        st.markdown(source_links)
     render_venue_feature_card(race.get("venue"))
 
     if result_rows.empty:
