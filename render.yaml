@@ -12,3 +12,5 @@ services:
         value: Asia/Tokyo
       - key: ZEN_KEIRIN_APP_PASSWORD
         sync: false
+      - key: ZEN_KEIRIN_DATABASE_URL
+        sync: false

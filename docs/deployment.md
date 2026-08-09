@@ -1,16 +1,51 @@
 # 外出先利用の公開手順
 
-`zenKeirin Lab` は Streamlit + SQLite の個人用アプリです。外出先から使う場合は、公開URLに加えて、SQLiteファイルを消さずに保存する場所と、最低限のアクセス制限が必要です。
+`zenKeirin Lab` は Streamlit の個人用アプリです。未設定時はSQLiteを使いますが、`ZEN_KEIRIN_DATABASE_URL` を設定するとPostgreSQL/Supabaseを正本DBとして使えます。外出先から使う場合は、公開URLに加えて、永続DBと最低限のアクセス制限が必要です。
 
 ## 現在のRender構成
 
 - ホスティング: Render Web Service
 - インスタンス: Free
-- 保存先: Renderの一時ファイル領域
-- DBパス: `data/zen_keirin_lab.sqlite3`
+- 保存先: `ZEN_KEIRIN_DATABASE_URL` 未設定ならRenderの一時ファイル領域
+- DBパス: SQLite時は `data/zen_keirin_lab.sqlite3`
 - 認証: `ZEN_KEIRIN_APP_PASSWORD` による簡易パスワード
 
-まず外出先から開けるURLを作るため、現在の `render.yaml` は無料構成にしています。RenderのFree Web ServiceはPersistent Diskを使えないため、再起動や再デプロイでSQLite DBが消える可能性があります。実戦記録を長期保存する本運用では、下の有料ディスク構成かPostgreSQL/Supabase化に切り替えます。
+まず外出先から開けるURLを作るため、現在の `render.yaml` は無料構成にしています。RenderのFree Web ServiceはPersistent Diskを使えないため、SQLiteのままだと再起動や再デプロイでDBが消える可能性があります。実戦記録を長期保存する本運用では、PostgreSQL/Supabase化を優先します。
+
+## Supabase / PostgreSQLを正本DBにする
+
+スマホ公開版とMacローカル版で同じデータを使う本命構成です。両方に同じ `ZEN_KEIRIN_DATABASE_URL` を設定すると、同じクラウドDBを読み書きします。
+
+1. Supabaseでプロジェクトを用意する。
+2. Dashboardの `Connect` からPostgreSQL接続URLをコピーする。
+3. Renderの環境変数に `ZEN_KEIRIN_DATABASE_URL` を追加する。
+4. ローカルでは `.streamlit/secrets.toml` か環境変数に同じ `ZEN_KEIRIN_DATABASE_URL` を入れる。
+5. 初回起動時に必要テーブルが自動作成される。
+
+RenderなどIPv4前提の環境では、Supabaseの `Session pooler` の接続URLを使うのが扱いやすいです。接続URLはSecretとして扱い、Gitにはコミットしません。
+
+ローカルで環境変数を使う例:
+
+```bash
+export ZEN_KEIRIN_DATABASE_URL='postgresql://postgres.xxxxx:password@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres'
+streamlit run app.py
+```
+
+既存SQLite DBをSupabaseへ取り込む例:
+
+```bash
+python scripts/migrate_sqlite_to_postgres.py \
+  --sqlite-db data/zen_keirin_lab.sqlite3 \
+  --database-url 'postgresql://postgres.xxxxx:password@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres'
+```
+
+公開アプリ上でも、サイドバーの `DBバックアップ/復元` からSQLite DBをアップロードすると、PostgreSQL接続中はクラウドDBへ上書き取込します。
+
+## 認証の現在地
+
+現時点では `ZEN_KEIRIN_APP_PASSWORD` による共通パスワードだけで保護します。スマホ公開版もローカル版も同じクラウドDBを見るため、パスワードを知っている人は同じ記録を操作できます。
+
+後で自分以外にも使えるようにする場合は、Supabase Authなどで個別ログインを追加し、ユーザーごとの権限とデータ分離をRLSで設計します。今はその前段階として、DBだけクラウド正本に寄せています。
 
 ## 推奨構成
 
@@ -92,8 +127,4 @@ Streamlit Community Cloudでも起動は簡単です。GitHubリポジトリ、�
 ZEN_KEIRIN_APP_PASSWORD = "自分だけのパスワード"
 ```
 
-ただし、現行のSQLite書き込みを長期保存する用途では、永続DBまたは外部DBへの移行が必要です。閲覧・軽い検証ならよいですが、実戦記録の正本にするならRender Persistent DiskかPostgres化を優先します。
-
-## 将来の本命案
-
-複数端末から同時に書いたり、長く本格運用する場合は、SQLiteのまま外に置くより PostgreSQL / Supabase へ移行します。その場合は `get_conn()` 周辺とSQLの差分を整理し、DB移行スクリプトを作ってから進めます。
+ただし、SQLite書き込みを長期保存する用途では、永続DBまたは外部DBへの移行が必要です。閲覧・軽い検証ならよいですが、実戦記録の正本にするならPostgreSQL/Supabase化を優先します。
