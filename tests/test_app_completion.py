@@ -616,6 +616,142 @@ class AppCompletionTest(unittest.TestCase):
         self.assertEqual(saved["source_result_url"], tipstar_url)
         self.assertEqual(saved["source_status"], "補完済み")
 
+    def test_tipstar_result_candidates_include_finished_tipstar_purchase_race(self):
+        tipstar_url = "https://tipstar.com/order/result?raceType=keirin&raceId=2026-07-26_23_03"
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-26",
+                "venue": "取手",
+                "race_no": 3,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "TIPメダル",
+                "status": "購入済み",
+                "race_title": "",
+                "source_ref": tipstar_url,
+                "line_summary": "",
+                "race_memo": "",
+            },
+        )
+        app.add_bet(
+            race_id,
+            {
+                "ticket_type": "2車単",
+                "combination": "1-2",
+                "amount_unit": "TIPメダル",
+                "stake": 100,
+                "payout": 0,
+                "expected_role": "本線",
+                "strategy_type": "1〜3着候補",
+                "prediction_source": "自分予想",
+                "note": "TIPSTAR購入",
+            },
+        )
+
+        candidates = app.tipstar_result_candidates(app.fetch_races(), limit=None)
+
+        self.assertEqual(candidates["id"].astype(int).tolist(), [race_id])
+
+    def test_sync_tipstar_result_candidates_updates_result_and_bet_payout(self):
+        racecard_url = "https://www.winticket.jp/keirin/toride/racecard/2026072623/1/3"
+        result_url = racecard_url.replace("/racecard/", "/raceresult/")
+        tipstar_url = "https://tipstar.com/order/result?raceType=keirin&raceId=2026-07-26_23_03"
+        race_id = app.upsert_race(
+            None,
+            {
+                "race_date": "2026-07-26",
+                "venue": "取手",
+                "race_no": 3,
+                "grade": "",
+                "distance": 0,
+                "weather": "",
+                "wind": 0.0,
+                "amount_unit": "TIPメダル",
+                "status": "購入済み",
+                "race_title": "",
+                "source_ref": tipstar_url,
+                "line_summary": "",
+                "race_memo": "",
+            },
+        )
+        app.add_bet(
+            race_id,
+            {
+                "ticket_type": "2車単",
+                "combination": "1-2",
+                "amount_unit": "TIPメダル",
+                "stake": 200,
+                "payout": 0,
+                "expected_role": "本線",
+                "strategy_type": "1〜3着候補",
+                "prediction_source": "自分予想",
+                "note": "TIPSTAR購入",
+            },
+        )
+
+        def fake_fetcher(url):
+            if url == "https://www.winticket.jp/keirin/racecard/20260726":
+                return """
+                <h2>出走表一覧</h2>
+                <a href="/keirin/toride/racecard/2026072623/1/3">3R</a>
+                """
+            if url == racecard_url:
+                return """
+                A級チ一般
+                発走 10:59 締切 10:54
+                2026年7月26日 1,625m (4周) 曇34.0℃北北西1.0m/s
+                枠 車
+                選手名
+                1
+                1
+                山田太郎 東京 A1 30歳 100期
+                80.00
+                3.92 自力。
+                2
+                2
+                佐藤次郎 神奈川 A1 31歳 101期
+                79.00
+                3.92 山田君。
+                並び予想
+                1
+                2
+                結果
+                """
+            if url == result_url:
+                return """
+                並び予想
+                1
+                2
+                着順 ビデオ 映像を観る
+                着 車 選手名 着差 上り 決 SB
+                1
+                1
+                山田太郎 東京 A1 30歳 100期
+                11.6 逃 B
+                2
+                2
+                佐藤次郎 神奈川 A1 31歳 101期
+                1車輪 11.5
+                払戻金
+                賭け式 払戻金 人気
+                2車単 1-2 300 円(1)
+                """
+            raise AssertionError(f"unexpected url: {url}")
+
+        result = app.sync_tipstar_result_candidates(limit=5, fetcher=fake_fetcher)
+
+        self.assertEqual(len(result["synced"]), 1)
+        saved = app.fetch_race(race_id)
+        self.assertEqual(saved["source_result_url"], tipstar_url)
+        self.assertEqual(saved["source_status"], "補完済み")
+        self.assertEqual(len(app.fetch_result_rows(race_id)), 2)
+        bets = app.fetch_bets(race_id)
+        self.assertEqual(int(bets.iloc[0]["hit"]), 1)
+        self.assertEqual(int(bets.iloc[0]["payout"]), 600)
+
     def test_sync_winticket_race_list_can_hydrate_details_and_mark_finished(self):
         racecard_url = "https://www.winticket.jp/keirin/wakayama/racecard/2026072455/3/1"
         result_url = racecard_url.replace("/racecard/", "/raceresult/")

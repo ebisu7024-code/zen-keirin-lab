@@ -129,9 +129,12 @@ TIP_MEDAL_DAILY_GRANT = 10000
 TIP_MEDAL_RESET_TEXT = "翌日3:00"
 TODAY_SYNC_VERSION = "startup-latest-v1"
 STARTUP_SYNC_HYDRATE_LIMIT = 5
+TIPSTAR_RESULT_SYNC_VERSION = "tipstar-result-v1"
+TIPSTAR_RESULT_AUTO_SYNC_LIMIT = 5
 TIPSTAR_ORDER_RESULT_URL = "https://tipstar.com/order/result"
 TIPSTAR_REFERENCE_STATUS = "TIPSTAR参照"
 ADJUSTMENT_SOURCE_STATUSES = {"TIPSTAR年次差額調整"}
+UNORDERED_TICKET_TYPES = {"2車複", "ワイド", "3連複"}
 REQUIRED_DB_TABLES = (
     "races",
     "riders",
@@ -226,6 +229,19 @@ def startup_sync_hydrate_limit() -> int:
         return max(0, int(raw_value))
     except ValueError:
         return STARTUP_SYNC_HYDRATE_LIMIT
+
+
+def tipstar_result_auto_sync_limit() -> int:
+    raw_value = (
+        os.environ.get("ZEN_KEIRIN_TIPSTAR_RESULT_SYNC_LIMIT", "").strip()
+        or streamlit_secret_text("ZEN_KEIRIN_TIPSTAR_RESULT_SYNC_LIMIT")
+    )
+    if not raw_value:
+        return TIPSTAR_RESULT_AUTO_SYNC_LIMIT
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return TIPSTAR_RESULT_AUTO_SYNC_LIMIT
 
 
 def first_url_text(value: str | None) -> str:
@@ -1028,6 +1044,32 @@ def hit_rate_metric_text(hit_count: int, bet_count: int) -> str:
     return f"{hit_rate(int(hit_count), int(bet_count))}%"
 
 
+def payout_combination_key(ticket_type: str, combination: str | None) -> str:
+    numbers = list(parse_numbers(combination))
+    if ticket_type in UNORDERED_TICKET_TYPES:
+        numbers = sorted(numbers)
+    if numbers:
+        return "-".join(str(number) for number in numbers)
+    return str(combination or "").strip()
+
+
+def payout_lookup_key(ticket_type: str, combination: str | None) -> tuple[str, str]:
+    normalized_ticket_type = str(ticket_type or "").strip()
+    return (normalized_ticket_type, payout_combination_key(normalized_ticket_type, combination))
+
+
+def payout_lookup_from_rows(payout_rows: pd.DataFrame) -> dict[tuple[str, str], int]:
+    lookup: dict[tuple[str, str], int] = {}
+    for _, payout in payout_rows.iterrows():
+        key = payout_lookup_key(str(payout["ticket_type"]), str(payout["combination"]))
+        lookup[key] = int(payout["payout"] or 0)
+    return lookup
+
+
+def estimated_bet_payout(stake: int | float, official_payout: int | float) -> int:
+    return int(round(float(official_payout or 0) * float(stake or 0) / 100))
+
+
 def default_bet_unit(race_unit: str) -> str:
     return race_unit if race_unit in BET_AMOUNT_UNITS else "TIPメダル"
 
@@ -1046,6 +1088,23 @@ def has_passed_race_close(race_date: str | None, close_time: str | None) -> bool
     except ValueError:
         return False
     return app_now().replace(tzinfo=None) >= close_at
+
+
+def is_past_race_date(race_date: str | None) -> bool:
+    race_date_text = str(race_date or "").strip()
+    if not race_date_text:
+        return False
+    try:
+        return date.fromisoformat(race_date_text) < app_today()
+    except ValueError:
+        return False
+
+
+def is_finished_or_past_race(row: pd.Series) -> bool:
+    status = str(row.get("status", "") or "").strip()
+    if status in {"終了", "結果入力済み", "振り返り済み"}:
+        return True
+    return is_past_race_date(row.get("race_date")) or has_passed_race_close(row.get("race_date"), row.get("close_time"))
 
 
 def status_after_public_sync(current_status: str | None, race_date: str | None, close_time: str | None, has_result: bool) -> str:
@@ -2011,10 +2070,19 @@ def recompute_hits_for_race(race_id: int) -> None:
     bets = fetch_bets(race_id)
     if bets.empty:
         return
+    payout_lookup = payout_lookup_from_rows(fetch_payouts(race_id))
     with get_conn() as conn:
         for _, bet in bets.iterrows():
             hit = int(judge_ticket_hit(bet["ticket_type"], bet["combination"], result_numbers))
-            conn.execute("UPDATE bets SET hit = ?, updated_at = ? WHERE id = ?", (hit, now_text(), int(bet["id"])))
+            current_payout = int(bet["payout"] or 0)
+            next_payout = current_payout
+            official_payout = payout_lookup.get(payout_lookup_key(str(bet["ticket_type"]), str(bet["combination"])), 0)
+            if hit and current_payout == 0 and official_payout > 0:
+                next_payout = estimated_bet_payout(int(bet["stake"] or 0), official_payout)
+            conn.execute(
+                "UPDATE bets SET hit = ?, payout = ?, updated_at = ? WHERE id = ?",
+                (hit, next_payout, now_text(), int(bet["id"])),
+            )
 
 
 def _empty_preserving_text(column: str) -> str:
@@ -2569,6 +2637,79 @@ def sync_winticket_candidates(limit: int = 5) -> dict:
                     "払戻": len(source.payouts),
                 }
             )
+    return result
+
+
+def tipstar_result_candidates(races: pd.DataFrame, limit: int | None = 30) -> pd.DataFrame:
+    if races.empty:
+        return pd.DataFrame()
+    source_ids = races["source_race_id"].fillna("").astype(str)
+    source_result_urls = races["source_result_url"].fillna("").astype(str) if "source_result_url" in races.columns else pd.Series("", index=races.index)
+    result_row_counts = races["result_row_count"].fillna(0).astype(int)
+    payout_counts = races["payout_count"].fillna(0).astype(int)
+    bet_counts = races["bet_count"].fillna(0).astype(int) if "bet_count" in races.columns else pd.Series(0, index=races.index)
+    finished_or_past = races.apply(is_finished_or_past_race, axis=1)
+    needs_result = (result_row_counts == 0) | (payout_counts == 0)
+    has_tipstar_ref = source_result_urls.apply(is_tipstar_order_result_url)
+    has_purchase_context = (bet_counts > 0) | races["status"].fillna("").astype(str).isin(["購入済み", "終了", "結果入力済み"])
+    candidates = races[
+        (source_ids != "")
+        & has_tipstar_ref
+        & needs_result
+        & finished_or_past
+        & has_purchase_context
+    ].copy()
+    candidates = candidates.sort_values(["race_date", "id"], ascending=[False, False])
+    if limit is not None:
+        return candidates.head(int(limit))
+    return candidates
+
+
+def sync_tipstar_result_candidates(limit: int = 5, fetcher=None) -> dict:
+    all_candidates = tipstar_result_candidates(fetch_races(), limit=None)
+    candidates = all_candidates.head(int(limit))
+    result = {"synced": [], "failed": [], "skipped": 0}
+    if candidates.empty:
+        return result
+    for _, row in candidates.iterrows():
+        race_id = int(row["id"])
+        label = f"{row['race_date']} {row['venue']} {int(row['race_no'])}R"
+        try:
+            source = sync_winticket_for_race(race_id, fetcher=fetcher)
+        except Exception as exc:
+            result["failed"].append({"レース": label, "理由": str(exc)})
+        else:
+            bets = fetch_bets(race_id)
+            auto_payouts = int((bets["payout"].fillna(0).astype(int) > 0).sum()) if not bets.empty else 0
+            result["synced"].append(
+                {
+                    "レース": label,
+                    "選手": len(source.riders),
+                    "結果": len(source.result_rows),
+                    "払戻表": len(source.payouts),
+                    "買い目払戻": auto_payouts,
+                }
+            )
+    result["skipped"] = max(0, len(all_candidates) - len(candidates))
+    return result
+
+
+def sync_tipstar_results_once() -> dict | None:
+    limit = tipstar_result_auto_sync_limit()
+    if limit <= 0:
+        return None
+    today_text = app_today_text()
+    session_key = f"tipstar_results_synced_{today_text}_{TIPSTAR_RESULT_SYNC_VERSION}_{limit}"
+    if st.session_state.get(session_key):
+        return st.session_state.get("tipstar_result_sync_result")
+    try:
+        result = sync_tipstar_result_candidates(limit=limit)
+    except Exception as exc:
+        result = {"error": str(exc), "synced": [], "failed": [], "skipped": 0}
+    else:
+        result["auto_limit"] = limit
+    st.session_state[session_key] = True
+    st.session_state["tipstar_result_sync_result"] = result
     return result
 
 
@@ -3972,6 +4113,69 @@ def render_today_races_panel(races: pd.DataFrame, sync_result: dict | None) -> N
     )
 
 
+def render_tipstar_result_sync_panel(races: pd.DataFrame, sync_result: dict | None = None) -> None:
+    st.markdown("#### TIPSTAR結果反映")
+    pending = tipstar_result_candidates(races, limit=None)
+
+    if sync_result:
+        if sync_result.get("error"):
+            st.warning(f"自動反映に失敗しました: {sync_result['error']}")
+        else:
+            synced_count = len(sync_result.get("synced", []))
+            failed_count = len(sync_result.get("failed", []))
+            skipped_count = int(sync_result.get("skipped", 0) or 0)
+            if synced_count or failed_count:
+                st.caption(f"自動反映: 完了{synced_count}件 / 失敗{failed_count}件 / 残り{skipped_count}件")
+
+    col_link, col_pending, col_limit, col_run = st.columns([2, 1, 1, 1])
+    col_link.markdown(f"[TIPSTAR購入結果]({TIPSTAR_ORDER_RESULT_URL})")
+    col_pending.metric("反映待ち", f"{len(pending)}")
+    limit = col_limit.selectbox("反映件数", [3, 5, 10, 20, 50], index=1, key="tipstar_result_sync_limit")
+    if col_run.button("結果を反映", use_container_width=True, disabled=pending.empty):
+        with st.spinner("TIPSTAR参照レースの結果を反映しています..."):
+            result = sync_tipstar_result_candidates(limit=int(limit))
+        st.session_state["tipstar_result_sync_result"] = result
+        if result["synced"]:
+            st.success(f"{len(result['synced'])}件を反映しました。")
+            st.dataframe(pd.DataFrame(result["synced"]), use_container_width=True, hide_index=True)
+        if result["failed"]:
+            st.warning(f"{len(result['failed'])}件は反映できませんでした。")
+            st.dataframe(pd.DataFrame(result["failed"]), use_container_width=True, hide_index=True)
+        st.rerun()
+
+    if not pending.empty:
+        with st.expander("反映待ちレース", expanded=False):
+            pending_view = pending.head(20).copy()
+            pending_view["race_id"] = pending_view["id"].astype(int)
+            st.dataframe(
+                pending_view[
+                    [
+                        "race_id",
+                        "race_date",
+                        "venue",
+                        "race_no",
+                        "status",
+                        "bet_count",
+                        "result_row_count",
+                        "payout_count",
+                    ]
+                ].rename(
+                    columns={
+                        "race_id": "ID",
+                        "race_date": "日付",
+                        "venue": "場",
+                        "race_no": "R",
+                        "status": "状態",
+                        "bet_count": "買い目",
+                        "result_row_count": "結果詳細",
+                        "payout_count": "払戻表",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
 def render_winticket_sync_panel(selected_race_id: int | None, races: pd.DataFrame | None = None) -> None:
     st.markdown("#### WINTICKET補完")
     if not selected_race_id:
@@ -4478,7 +4682,12 @@ def render_rider_position_insights() -> None:
         )
 
 
-def render_dashboard(races: pd.DataFrame, selected_race_id: int | None, sync_result: dict | None = None) -> None:
+def render_dashboard(
+    races: pd.DataFrame,
+    selected_race_id: int | None,
+    sync_result: dict | None = None,
+    tipstar_sync_result: dict | None = None,
+) -> None:
     render_header(None)
     if races.empty:
         render_today_races_panel(races, sync_result)
@@ -4502,6 +4711,8 @@ def render_dashboard(races: pd.DataFrame, selected_race_id: int | None, sync_res
     col5.metric("的中率", f"{hit_rate(hit_count, len(hit_rate_bets))}%" if not hit_rate_bets.empty else "0.0%")
 
     render_today_races_panel(races, sync_result)
+
+    render_tipstar_result_sync_panel(races, tipstar_sync_result)
 
     render_winticket_sync_panel(selected_race_id, races)
 
@@ -5542,12 +5753,13 @@ def main() -> None:
     init_db()
     refresh_public_statuses(app_today_text())
     today_sync_result = sync_today_winticket_races_once()
+    tipstar_sync_result = sync_tipstar_results_once()
     races = fetch_races()
     selected_race_id = sidebar_select_race(races)
     page = st.session_state.get("page", "ダッシュボード")
 
     if page == "ダッシュボード":
-        render_dashboard(races, selected_race_id, today_sync_result)
+        render_dashboard(races, selected_race_id, today_sync_result, tipstar_sync_result)
     elif page == "競輪場特徴":
         render_venue_features_page(races, selected_race_id)
     elif page == "レース登録":

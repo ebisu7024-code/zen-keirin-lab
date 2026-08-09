@@ -48,6 +48,12 @@ python scripts/migrate_sqlite_to_postgres.py \
 
 後で自分以外にも使えるようにする場合は、Supabase Authなどで個別ログインを追加し、ユーザーごとの権限とデータ分離をRLSで設計します。今はその前段階として、DBだけクラウド正本に寄せています。
 
+## TIPSTAR結果反映
+
+TIPSTARの購入結果URLに含まれる `raceId` を保存しておくと、公開WINTICKET結果から着順・払戻表・買い目的中判定を自動補完します。起動時は `ZEN_KEIRIN_TIPSTAR_RESULT_SYNC_LIMIT` 件まで自動反映し、ダッシュボードから手動で追加反映できます。
+
+TIPSTARの購入結果ページ自体はログインが必要なため、Render上のアプリはTIPSTARのログイン履歴を直接取得しません。購入額が入っている買い目は、公式払戻表と組番が一致したときに `公式払戻 × 購入額 / 100` で払戻を自動入力します。
+
 ## 推奨構成
 
 - ホスティング: Render Web Service
