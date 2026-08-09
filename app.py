@@ -423,6 +423,29 @@ def table_columns(conn, table: str) -> list[str]:
     return sqlite_table_columns(conn, table)
 
 
+def postgres_table_column_types(conn, table: str) -> dict[str, str]:
+    rows = conn.execute(
+        """
+        SELECT column_name AS name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = ?
+        """,
+        (safe_identifier(table),),
+    ).fetchall()
+    return {row["name"]: row["data_type"] for row in rows}
+
+
+def normalize_sqlite_value_for_postgres(value, postgres_type: str):
+    if value != "":
+        return value
+    if postgres_type in {"integer", "bigint", "smallint"}:
+        return 0
+    if postgres_type in {"real", "double precision", "numeric", "decimal"}:
+        return 0.0
+    return value
+
+
 def table_primary_key_columns(conn, table: str) -> tuple[str, ...]:
     table = safe_identifier(table)
     if is_postgres_connection(conn):
@@ -551,8 +574,27 @@ def enable_postgres_row_level_security(conn) -> None:
         conn.execute(f"ALTER TABLE {safe_identifier(table)} ENABLE ROW LEVEL SECURITY")
 
 
+def apply_runtime_data_fixes(conn) -> None:
+    backfill_source_race_ids(conn)
+    conn.execute(
+        """
+        UPDATE bets
+        SET amount_unit = (
+            SELECT amount_unit
+            FROM races
+            WHERE races.id = bets.race_id
+        )
+        WHERE amount_unit IS NULL OR amount_unit = ''
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
+        if is_postgres_connection(conn) and set(REQUIRED_DB_TABLES).issubset(list_active_table_names(conn)):
+            apply_runtime_data_fixes(conn)
+            return
+
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS races (
@@ -702,19 +744,8 @@ def init_db() -> None:
         ensure_column(conn, "bets", "strategy_type", "TEXT DEFAULT ''")
         ensure_column(conn, "bets", "prediction_source", "TEXT DEFAULT ''")
         migrate_race_result_rows_primary_key(conn)
-        backfill_source_race_ids(conn)
         enable_postgres_row_level_security(conn)
-        conn.execute(
-            """
-            UPDATE bets
-            SET amount_unit = (
-                SELECT amount_unit
-                FROM races
-                WHERE races.id = bets.race_id
-            )
-            WHERE amount_unit IS NULL OR amount_unit = ''
-            """
-        )
+        apply_runtime_data_fixes(conn)
 
 
 def count_tables_in_sqlite_file(db_path: Path) -> dict[str, int]:
@@ -790,22 +821,12 @@ def import_sqlite_database_to_active_db(sqlite_path: Path) -> dict[str, int]:
     init_db()
     with sqlite3.connect(sqlite_path) as source_conn, get_conn() as dest_conn:
         source_conn.row_factory = sqlite3.Row
-        dest_conn.execute(
-            """
-            TRUNCATE TABLE
-                race_lines,
-                race_payouts,
-                race_result_rows,
-                results,
-                bets,
-                riders,
-                races
-            RESTART IDENTITY CASCADE
-            """
-        )
+        for table in reversed(REQUIRED_DB_TABLES):
+            dest_conn.execute(f"DELETE FROM {safe_identifier(table)}")
         for table in REQUIRED_DB_TABLES:
             source_columns = sqlite_table_columns(source_conn, table)
             destination_columns = table_columns(dest_conn, table)
+            destination_types = postgres_table_column_types(dest_conn, table)
             columns = [column for column in destination_columns if column in source_columns]
             if not columns:
                 continue
@@ -814,7 +835,10 @@ def import_sqlite_database_to_active_db(sqlite_path: Path) -> dict[str, int]:
             if not rows:
                 continue
             placeholders = ", ".join("?" for _ in columns)
-            payload = [tuple(row[column] for column in columns) for row in rows]
+            payload = [
+                tuple(normalize_sqlite_value_for_postgres(row[column], destination_types.get(column, "")) for column in columns)
+                for row in rows
+            ]
             dest_conn.executemany(
                 f"INSERT INTO {safe_identifier(table)} ({column_list}) VALUES ({placeholders})",
                 payload,
