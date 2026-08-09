@@ -1,12 +1,12 @@
 # 外出先利用の公開手順
 
-`zenKeirin Lab` は Streamlit の個人用アプリです。未設定時はSQLiteを使いますが、`ZEN_KEIRIN_DATABASE_URL` を設定するとPostgreSQL/Supabaseを正本DBとして使えます。外出先から使う場合は、公開URLに加えて、永続DBと最低限のアクセス制限が必要です。
+`zenKeirin Lab` は Streamlit の個人用アプリです。`ZEN_KEIRIN_DATABASE_URL` を設定するとPostgreSQL/Supabaseを正本DBとして使えます。このリポジトリのRender公開版では、URL未設定でも `ZEN_KEIRIN_APP_PASSWORD` からSupabaseのアプリ専用ロールへ接続します。外出先から使う場合は、公開URLに加えて、永続DBと最低限のアクセス制限が必要です。
 
 ## 現在のRender構成
 
 - ホスティング: Render Web Service
 - インスタンス: Free
-- 保存先: `ZEN_KEIRIN_DATABASE_URL` 未設定ならRenderの一時ファイル領域
+- 保存先: `ZEN_KEIRIN_DATABASE_URL` があればそのDB。未設定時は `ZEN_KEIRIN_APP_PASSWORD` でSupabase app roleへ接続
 - DBパス: SQLite時は `data/zen_keirin_lab.sqlite3`
 - 認証: `ZEN_KEIRIN_APP_PASSWORD` による簡易パスワード
 
@@ -14,15 +14,16 @@
 
 ## Supabase / PostgreSQLを正本DBにする
 
-スマホ公開版とMacローカル版で同じデータを使う本命構成です。両方に同じ `ZEN_KEIRIN_DATABASE_URL` を設定すると、同じクラウドDBを読み書きします。
+スマホ公開版とMacローカル版で同じデータを使う本命構成です。両方に同じ `ZEN_KEIRIN_DATABASE_URL` を設定すると、同じクラウドDBを読み書きします。このリポジトリの既定運用では、Renderに `ZEN_KEIRIN_APP_PASSWORD` だけ入っていれば、Supabaseの `zen_keirin_app` ロールへ接続します。
 
 1. Supabaseでプロジェクトを用意する。
 2. Dashboardの `Connect` からPostgreSQL接続URLをコピーする。
-3. Renderの環境変数に `ZEN_KEIRIN_DATABASE_URL` を追加する。
-4. ローカルでは `.streamlit/secrets.toml` か環境変数に同じ `ZEN_KEIRIN_DATABASE_URL` を入れる。
-5. 初回起動時に必要テーブルが自動作成される。
+3. Renderの環境変数に `ZEN_KEIRIN_APP_PASSWORD` を追加する。
+4. 別DBに向ける場合だけ、Renderの環境変数に `ZEN_KEIRIN_DATABASE_URL` を追加する。
+5. ローカルでは `.streamlit/secrets.toml` か環境変数に同じ値を入れる。
+6. 初回起動時に必要テーブルが自動作成される。
 
-RenderなどIPv4前提の環境では、Supabaseの `Session pooler` の接続URLを使うのが扱いやすいです。接続URLはSecretとして扱い、Gitにはコミットしません。
+RenderなどIPv4前提の環境では、Supabaseの `Session pooler` の接続URLを使うのが扱いやすいです。接続URLやパスワードはSecretとして扱い、Gitにはコミットしません。
 
 ローカルで環境変数を使う例:
 
@@ -50,12 +51,12 @@ python scripts/migrate_sqlite_to_postgres.py \
 ## 推奨構成
 
 - ホスティング: Render Web Service
-- インスタンス: Starter以上
-- 保存先: Render Persistent Disk
-- DBパス: `/var/data/zen_keirin_lab.sqlite3`
+- インスタンス: Free以上
+- 保存先: Supabase PostgreSQL
+- DB接続: `ZEN_KEIRIN_APP_PASSWORD` からSupabase app roleへ接続。必要に応じて `ZEN_KEIRIN_DATABASE_URL` で明示指定
 - 認証: `ZEN_KEIRIN_APP_PASSWORD` による簡易パスワード
 
-この構成なら、アプリ本体はGitHubからデプロイしつつ、レース記録DBはRenderの永続ディスクに保存できます。無料Web Serviceの一時ファイル領域にSQLiteを置くと、再起動や再デプロイでDBが消える可能性があるため、本運用では避けます。
+この構成なら、アプリ本体はGitHubからデプロイしつつ、レース記録DBはSupabaseに保存できます。無料Web Serviceの一時ファイル領域にSQLiteを置くと、再起動や再デプロイでDBが消える可能性があるため、本運用では避けます。
 
 ## Renderで作る
 

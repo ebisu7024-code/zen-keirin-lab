@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -54,6 +55,9 @@ fetch_winticket_race_listings = winticket_source_module.fetch_winticket_race_lis
 
 APP_DIR = Path(__file__).resolve().parent
 APP_TIME_ZONE = ZoneInfo("Asia/Tokyo")
+SUPABASE_PROJECT_REF = "jkpwhjixjwpraefimheb"
+SUPABASE_POOLER_HOST = "aws-1-ap-northeast-1.pooler.supabase.com"
+SUPABASE_APP_ROLE = "zen_keirin_app"
 
 
 def configured_db_path() -> Path:
@@ -158,6 +162,24 @@ def configured_app_password() -> str:
         or streamlit_secret_text("app_password")
         or streamlit_secret_text("auth", "password")
     )
+
+
+def configured_database_password() -> str:
+    return (
+        os.environ.get("ZEN_KEIRIN_DATABASE_PASSWORD", "").strip()
+        or streamlit_secret_text("ZEN_KEIRIN_DATABASE_PASSWORD")
+        or streamlit_secret_text("database", "password")
+        or configured_app_password()
+    )
+
+
+def default_supabase_database_url() -> str:
+    password = configured_database_password()
+    if not password:
+        return ""
+    user = f"{SUPABASE_APP_ROLE}.{SUPABASE_PROJECT_REF}"
+    encoded_password = quote(password, safe="")
+    return f"postgresql://{user}:{encoded_password}@{SUPABASE_POOLER_HOST}:5432/postgres?sslmode=require"
 
 
 def require_app_password() -> None:
@@ -339,6 +361,7 @@ def configured_database_url() -> str:
         or streamlit_secret_text("ZEN_KEIRIN_DATABASE_URL")
         or streamlit_secret_text("DATABASE_URL")
         or streamlit_secret_text("database", "url")
+        or default_supabase_database_url()
     )
 
 

@@ -15,6 +15,18 @@ class AppCompletionTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_data_dir = app.DATA_DIR
         self.original_db_path = app.DB_PATH
+        self.secret_patch = patch("app.streamlit_secret_text", return_value="")
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "ZEN_KEIRIN_DATABASE_URL": "",
+                "DATABASE_URL": "",
+                "ZEN_KEIRIN_DATABASE_PASSWORD": "",
+                "ZEN_KEIRIN_APP_PASSWORD": "",
+            },
+        )
+        self.secret_patch.start()
+        self.env_patch.start()
         app.DATA_DIR = Path(self.temp_dir.name)
         app.DB_PATH = app.DATA_DIR / "test.sqlite3"
         app.init_db()
@@ -22,6 +34,8 @@ class AppCompletionTest(unittest.TestCase):
     def tearDown(self):
         app.DATA_DIR = self.original_data_dir
         app.DB_PATH = self.original_db_path
+        self.env_patch.stop()
+        self.secret_patch.stop()
         self.temp_dir.cleanup()
 
     def test_configured_db_path_uses_environment_override(self):
@@ -32,6 +46,16 @@ class AppCompletionTest(unittest.TestCase):
         with patch.dict(os.environ, {"ZEN_KEIRIN_DATABASE_URL": "postgresql://example.com/postgres"}):
             self.assertEqual(app.configured_database_url(), "postgresql://example.com/postgres")
             self.assertEqual(app.database_backend(), "postgres")
+
+    def test_database_url_falls_back_to_app_password_supabase_role(self):
+        with patch.dict(os.environ, {"ZEN_KEIRIN_APP_PASSWORD": "secret value"}):
+            database_url = app.configured_database_url()
+            backend = app.database_backend()
+
+        self.assertTrue(database_url.startswith("postgresql://zen_keirin_app.jkpwhjixjwpraefimheb:"))
+        self.assertIn("secret%20value", database_url)
+        self.assertIn("@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres", database_url)
+        self.assertEqual(backend, "postgres")
 
     def test_translate_sql_for_postgres_keeps_like_percent_and_rewrites_params(self):
         query = "SELECT * FROM races WHERE venue LIKE 'TIPSTAR%' AND race_no = ?"
