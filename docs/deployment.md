@@ -25,6 +25,12 @@
 
 RenderなどIPv4前提の環境では、Supabaseの `Session pooler` の接続URLを使うのが扱いやすいです。接続URLやパスワードはSecretとして扱い、Gitにはコミットしません。
 
+### iPhoneやRender公開URLでDB接続エラーが出る場合
+
+`tenant/user ... not found` や `pooler.supabase.com` を含む赤いエラーが出る場合は、アプリではなくクラウドDB接続の問題です。まずSupabase Dashboardで対象プロジェクトがActiveになっているか確認します。停止中なら再有効化し、数分待ってからRenderを再デプロイします。
+
+次に、Renderの環境変数を確認します。`ZEN_KEIRIN_DATABASE_URL` を設定している場合は、Supabase Dashboardの `Connect` からコピーした最新のSession pooler URLを使います。未設定で `ZEN_KEIRIN_APP_PASSWORD` から自動接続する運用では、Supabase側に `zen_keirin_app` ロールが存在し、そのロールのパスワードがRenderに設定したDB用パスワードと一致している必要があります。
+
 ローカルで環境変数を使う例:
 
 ```bash

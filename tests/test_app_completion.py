@@ -57,6 +57,12 @@ class AppCompletionTest(unittest.TestCase):
         self.assertIn("@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres", database_url)
         self.assertEqual(backend, "postgres")
 
+    def test_database_connection_error_detection_matches_supabase_pooler_failures(self):
+        exc = RuntimeError("connection failed: host aws-1-ap-northeast-1.pooler.supabase.com")
+
+        self.assertTrue(app.is_database_connection_error(exc))
+        self.assertFalse(app.is_database_connection_error(RuntimeError("validation failed")))
+
     def test_translate_sql_for_postgres_keeps_like_percent_and_rewrites_params(self):
         query = "SELECT * FROM races WHERE venue LIKE 'TIPSTAR%' AND race_no = ?"
 

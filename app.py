@@ -194,7 +194,7 @@ def require_app_password() -> None:
     st.caption("外部公開モード")
     with st.form("app_login_form"):
         password = st.text_input("パスワード", type="password")
-        submitted = st.form_submit_button("開く")
+        submitted = st.form_submit_button("開く", use_container_width=True)
 
     if submitted:
         if hmac.compare_digest(password, expected_password):
@@ -390,6 +390,32 @@ def database_backend() -> str:
 
 def database_backend_label() -> str:
     return "PostgreSQL / Supabase" if database_backend() == "postgres" else "SQLite"
+
+
+def is_database_connection_error(exc: Exception) -> bool:
+    if psycopg is not None and isinstance(exc, psycopg.OperationalError):
+        return True
+    message = str(exc).lower()
+    return "connection failed" in message and "pooler.supabase.com" in message
+
+
+def render_database_connection_error() -> None:
+    st.error("クラウドDBに接続できません。SupabaseまたはRenderのDB設定を確認してください。")
+    st.info(
+        "Supabaseプロジェクトが停止中、またはRenderのDB接続情報が古い可能性があります。"
+        "プロジェクトを再有効化してから、Renderを再デプロイしてください。"
+    )
+    st.markdown(
+        """
+        確認するもの:
+
+        - Supabase Dashboardで対象プロジェクトがActiveになっているか
+        - Renderの `ZEN_KEIRIN_DATABASE_URL` が最新のSession pooler URLか
+        - `ZEN_KEIRIN_DATABASE_URL` を使わない場合、`zen_keirin_app` ロールがSupabase側に存在するか
+        - DB用パスワードを分けている場合、Renderに `ZEN_KEIRIN_DATABASE_PASSWORD` が入っているか
+        """
+    )
+    st.stop()
 
 
 def is_postgres_connection(conn) -> bool:
@@ -2929,6 +2955,83 @@ def apply_style() -> None:
             font-size: 12px;
             font-weight: 900;
         }
+        div[data-testid="stForm"] {
+            border: 1px solid #2f3a4a;
+            border-radius: 12px;
+            padding: 20px 22px;
+            background: #151b23;
+            box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+            margin-bottom: 1.5rem;
+        }
+        [data-testid="stWidgetLabel"] p {
+            color: #aab4c2 !important;
+            font-weight: 600;
+            font-size: 0.92rem;
+        }
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stDateInput"] input,
+        div[data-testid="stTextArea"] textarea {
+            font-size: 16px;
+            min-height: 44px;
+            padding: 10px 12px;
+            border-radius: 8px;
+        }
+        div[data-testid="stSelectbox"] > div {
+            min-height: 44px;
+            font-size: 16px;
+        }
+        div[data-testid="stForm"] div[data-testid="stTextInput"],
+        div[data-testid="stForm"] div[data-testid="stNumberInput"],
+        div[data-testid="stForm"] div[data-testid="stSelectbox"],
+        div[data-testid="stForm"] div[data-testid="stTextArea"],
+        div[data-testid="stForm"] div[data-testid="stDateInput"],
+        div[data-testid="stForm"] div[data-testid="stSlider"],
+        div[data-testid="stForm"] div[data-testid="stCheckbox"] {
+            margin-bottom: 14px;
+        }
+        div[data-testid="stForm"] div[data-testid="stMarkdownContainer"] h4 {
+            margin: 18px 0 10px 0;
+            padding-bottom: 6px;
+            padding-left: 8px;
+            border-left: 3px solid #38bdf8;
+            border-bottom: 1px solid #2f3a4a;
+            color: #e5edf5;
+            font-size: 1rem;
+        }
+        div[data-testid="stForm"] div[data-testid="stContainer"] {
+            border: 1px solid #26313f;
+            border-radius: 8px;
+            padding: 14px 16px;
+            margin-bottom: 16px;
+            background: transparent;
+        }
+        button[data-testid*="FormSubmit"] {
+            min-height: 44px;
+            border-radius: 8px;
+        }
+        div[data-testid="stTextInput"] input:focus,
+        div[data-testid="stNumberInput"] input:focus,
+        div[data-testid="stTextArea"] textarea:focus,
+        div[data-testid="stDateInput"] input:focus {
+            border-color: #38bdf8 !important;
+            box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.25) !important;
+        }
+        div[data-testid="stForm"]:has(.st-key-FormSubmitter-app_login_form---) {
+            max-width: 360px;
+            margin: 40px auto 0 auto;
+        }
+        div[data-testid="stForm"]:has(.st-key-FormSubmitter-line_review_form---) {
+            padding: 14px 16px;
+        }
+        @media (max-width: 640px) {
+            div[data-testid="stForm"] {
+                padding: 14px 16px;
+            }
+            div[data-testid="stForm"] div[data-testid="stContainer"] {
+                padding: 12px 12px;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -4956,12 +5059,14 @@ def render_race_form(selected_race_id: int | None) -> None:
         default_date = date.fromisoformat(selected_race["race_date"])
 
     with st.form("race_form"):
+        st.markdown("#### 基本情報")
         col1, col2, col3, col4 = st.columns(4)
         race_date = col1.date_input("日付", value=default_date)
         venue = col2.text_input("開催場", value=selected_race.get("venue", ""))
         race_no = col3.number_input("レース番号", min_value=1, max_value=12, value=int(selected_race.get("race_no", 1) or 1))
         grade = col4.text_input("グレード", value=selected_race.get("grade", ""))
 
+        st.markdown("#### レース条件")
         col5, col6, col7, col8, col9 = st.columns(5)
         distance = col5.number_input("距離", min_value=0, value=int(selected_race.get("distance", 0) or 0), step=25)
         weather = col6.text_input("天候", value=selected_race.get("weather", ""))
@@ -4975,6 +5080,7 @@ def render_race_form(selected_race_id: int | None) -> None:
         status_value = selected_race.get("status", "予想中")
         status = col9.selectbox("状態", STATUS_OPTIONS, index=STATUS_OPTIONS.index(status_value) if status_value in STATUS_OPTIONS else 0)
 
+        st.markdown("#### レース情報・メモ")
         race_title = st.text_input("レース名・メモ見出し", value=selected_race.get("race_title", ""))
         source_default = (
             selected_race.get("source_result_url")
@@ -5042,50 +5148,58 @@ def render_riders(selected_race_id: int | None) -> None:
     existing = fetch_rider_by_car(selected_race_id, int(car_no))
 
     with st.form("rider_form"):
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        rider_name = col1.text_input("選手名", value=existing.get("rider_name", ""))
-        prefecture = col2.text_input("府県", value=existing.get("prefecture", ""))
-        age = col3.number_input("年齢", min_value=0, max_value=80, value=int(existing.get("age", 0) or 0))
-        racing_score = col4.number_input("競走得点", min_value=0.0, max_value=130.0, value=float(existing.get("racing_score", 0) or 0), step=0.1)
-        rider_class = col5.text_input("級班", value=existing.get("rider_class", ""))
-        term = col6.text_input("期", value=existing.get("term", ""))
+        with st.container(border=True):
+            st.markdown("#### 基本情報")
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            rider_name = col1.text_input("選手名", value=existing.get("rider_name", ""))
+            prefecture = col2.text_input("府県", value=existing.get("prefecture", ""))
+            age = col3.number_input("年齢", min_value=0, max_value=80, value=int(existing.get("age", 0) or 0))
+            racing_score = col4.number_input("競走得点", min_value=0.0, max_value=130.0, value=float(existing.get("racing_score", 0) or 0), step=0.1)
+            rider_class = col5.text_input("級班", value=existing.get("rider_class", ""))
+            term = col6.text_input("期", value=existing.get("term", ""))
 
-        col7, col8, col9, col10 = st.columns(4)
-        style_value = existing.get("style", "不明")
-        style = col7.selectbox("脚質", STYLE_OPTIONS, index=STYLE_OPTIONS.index(style_value) if style_value in STYLE_OPTIONS else 5)
-        line_name = col8.text_input("ライン名", value=existing.get("line_name", ""))
-        position_value = existing.get("line_position", "不明")
-        line_position = col9.selectbox(
-            "ライン位置",
-            POSITION_OPTIONS,
-            index=POSITION_OPTIONS.index(position_value) if position_value in POSITION_OPTIONS else 5,
-        )
-        mark_value = existing.get("final_mark", "")
-        final_mark = col10.selectbox("予想印", MARK_OPTIONS, index=MARK_OPTIONS.index(mark_value) if mark_value in MARK_OPTIONS else 0)
+            col7, col8, col9, col10 = st.columns(4)
+            style_value = existing.get("style", "不明")
+            style = col7.selectbox("脚質", STYLE_OPTIONS, index=STYLE_OPTIONS.index(style_value) if style_value in STYLE_OPTIONS else 5)
+            line_name = col8.text_input("ライン名", value=existing.get("line_name", ""))
+            position_value = existing.get("line_position", "不明")
+            line_position = col9.selectbox(
+                "ライン位置",
+                POSITION_OPTIONS,
+                index=POSITION_OPTIONS.index(position_value) if position_value in POSITION_OPTIONS else 5,
+            )
+            mark_value = existing.get("final_mark", "")
+            final_mark = col10.selectbox("予想印", MARK_OPTIONS, index=MARK_OPTIONS.index(mark_value) if mark_value in MARK_OPTIONS else 0)
+            recent_results = st.text_input("直近成績", value=existing.get("recent_results", ""))
 
-        st.markdown("#### 3層評価")
-        col11, col12, col13, col14 = st.columns(4)
-        score_ability = col11.slider("能力評価", 0, 100, int(existing.get("ability_score", 50) or 50))
-        score_development = col12.slider("展開評価", 0, 100, int(existing.get("development_score", 50) or 50))
-        score_mental = col13.slider("心理評価", 0, 100, int(existing.get("mental_score", 50) or 50))
-        score_relationship = col14.slider("関係性評価", 0, 100, int(existing.get("relationship_score", 50) or 50))
+        with st.container(border=True):
+            st.markdown("#### 3層評価")
+            col11, col12, col13, col14 = st.columns(4)
+            score_ability = col11.slider("能力評価", 0, 100, int(existing.get("ability_score", 50) or 50))
+            score_development = col12.slider("展開評価", 0, 100, int(existing.get("development_score", 50) or 50))
+            score_mental = col13.slider("心理評価", 0, 100, int(existing.get("mental_score", 50) or 50))
+            score_relationship = col14.slider("関係性評価", 0, 100, int(existing.get("relationship_score", 50) or 50))
 
-        col15, col16 = st.columns(2)
-        confidence_value = existing.get("confidence", "中")
-        confidence = col15.selectbox(
-            "確信度",
-            CONFIDENCE_LEVELS,
-            index=CONFIDENCE_LEVELS.index(confidence_value) if confidence_value in CONFIDENCE_LEVELS else 1,
-        )
-        info_value = existing.get("info_type", "Hypothesis")
-        info_type = col16.selectbox("情報区分", INFO_TYPES, index=INFO_TYPES.index(info_value) if info_value in INFO_TYPES else 3)
+            col15, col16 = st.columns(2)
+            confidence_value = existing.get("confidence", "中")
+            confidence = col15.selectbox(
+                "確信度",
+                CONFIDENCE_LEVELS,
+                index=CONFIDENCE_LEVELS.index(confidence_value) if confidence_value in CONFIDENCE_LEVELS else 1,
+            )
+            info_value = existing.get("info_type", "Hypothesis")
+            info_type = col16.selectbox("情報区分", INFO_TYPES, index=INFO_TYPES.index(info_value) if info_value in INFO_TYPES else 3)
 
-        recent_results = st.text_input("直近成績", value=existing.get("recent_results", ""))
-        rider_comment = st.text_area("本人コメント", value=existing.get("rider_comment", ""), height=90)
-        post_race_comment = st.text_area("レース後コメント", value=existing.get("post_race_comment", ""), height=80)
-        comment_eval = st.text_area("コメント検証", value=existing.get("comment_eval", ""), height=80)
-        human_note = st.text_area("心理・関係性メモ", value=existing.get("human_note", ""), height=100)
-        user_note = st.text_area("自分の予想メモ", value=existing.get("user_note", ""), height=100)
+        with st.container(border=True):
+            st.markdown("#### 選手コメント")
+            rider_comment = st.text_area("本人コメント", value=existing.get("rider_comment", ""), height=90)
+            post_race_comment = st.text_area("レース後コメント", value=existing.get("post_race_comment", ""), height=80)
+            comment_eval = st.text_area("コメント検証", value=existing.get("comment_eval", ""), height=80)
+
+        with st.container(border=True):
+            st.markdown("#### 自分の分析メモ")
+            human_note = st.text_area("心理・関係性メモ", value=existing.get("human_note", ""), height=100)
+            user_note = st.text_area("自分の予想メモ", value=existing.get("user_note", ""), height=100)
 
         submitted = st.form_submit_button("選手評価を保存", use_container_width=True)
 
@@ -5451,8 +5565,10 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
     col_left, col_right = st.columns(2)
     with col_left:
         with st.form("bet_form"):
-            ticket_type = st.selectbox("券種", TICKET_TYPES, index=6)
-            combination = st.text_input("買い目", placeholder="例: 1-3-5")
+            st.markdown("#### 買い目")
+            col_a, col_b = st.columns([1, 2])
+            ticket_type = col_a.selectbox("券種", TICKET_TYPES, index=6)
+            combination = col_b.text_input("買い目", placeholder="例: 1-3-5")
             col0, col1, col2 = st.columns(3)
             bet_unit = col0.selectbox(
                 "単位",
@@ -5461,6 +5577,8 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
             )
             stake = col1.number_input(f"購入（{bet_unit}）", min_value=0, value=100, step=100)
             payout = col2.number_input(f"払戻（{bet_unit}）", min_value=0, value=0, step=100)
+
+            st.markdown("#### 位置づけ・理由")
             col3, col4 = st.columns(2)
             strategy_type = col3.selectbox("買い方の型", STRATEGY_TYPES, index=0)
             prediction_source = col4.selectbox("予想区分", PREDICTION_SOURCES, index=1)
@@ -5598,13 +5716,15 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
     selected_bet_label = st.selectbox("更新する買い目", bet_labels)
     selected_bet = bets.iloc[bet_labels.index(selected_bet_label)]
     with st.form("update_bet_form"):
-        col1, col2, col3, col4, col5 = st.columns(5)
-        updated_ticket = col1.selectbox(
+        st.markdown("#### 買い目")
+        col_a, col_b = st.columns([1, 2])
+        updated_ticket = col_a.selectbox(
             "券種",
             TICKET_TYPES,
             index=TICKET_TYPES.index(selected_bet["ticket_type"]) if selected_bet["ticket_type"] in TICKET_TYPES else 0,
         )
-        updated_combo = col2.text_input("買い目", value=selected_bet["combination"])
+        updated_combo = col_b.text_input("買い目", value=selected_bet["combination"])
+        col3, col4, col5 = st.columns(3)
         updated_unit = col3.selectbox(
             "単位",
             BET_AMOUNT_UNITS,
@@ -5614,6 +5734,8 @@ def render_bets_and_results(selected_race_id: int | None) -> None:
         )
         updated_stake = col4.number_input(f"購入（{updated_unit}）", min_value=0, value=int(selected_bet["stake"]), step=100)
         updated_payout = col5.number_input(f"払戻（{updated_unit}）", min_value=0, value=int(selected_bet["payout"]), step=100)
+
+        st.markdown("#### 位置づけ・理由")
         col6, col7 = st.columns(2)
         strategy_value = selected_bet.get("strategy_type", "") if hasattr(selected_bet, "get") else ""
         source_value = selected_bet.get("prediction_source", "") if hasattr(selected_bet, "get") else ""
@@ -5746,15 +5868,25 @@ def render_review(selected_race_id: int | None) -> None:
             st.write(result.get("reflection") or "振り返りメモは未入力です。")
 
 
+def load_startup_state():
+    try:
+        init_db()
+        refresh_public_statuses(app_today_text())
+        today_sync_result = sync_today_winticket_races_once()
+        tipstar_sync_result = sync_tipstar_results_once()
+        races = fetch_races()
+    except Exception as exc:
+        if is_database_connection_error(exc):
+            render_database_connection_error()
+        raise
+    return today_sync_result, tipstar_sync_result, races
+
+
 def main() -> None:
     st.set_page_config(page_title="zenKeirin Lab", page_icon="K", layout="wide")
     apply_style()
     require_app_password()
-    init_db()
-    refresh_public_statuses(app_today_text())
-    today_sync_result = sync_today_winticket_races_once()
-    tipstar_sync_result = sync_tipstar_results_once()
-    races = fetch_races()
+    today_sync_result, tipstar_sync_result, races = load_startup_state()
     selected_race_id = sidebar_select_race(races)
     page = st.session_state.get("page", "ダッシュボード")
 
