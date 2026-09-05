@@ -31,6 +31,8 @@ RenderなどIPv4前提の環境では、Supabaseの `Session pooler` の接続UR
 
 次に、Renderの環境変数を確認します。`ZEN_KEIRIN_DATABASE_URL` を設定している場合は、Supabase Dashboardの `Connect` からコピーした最新のSession pooler URLを使います。未設定で `ZEN_KEIRIN_APP_PASSWORD` から自動接続する運用では、Supabase側に `zen_keirin_app` ロールが存在し、そのロールのパスワードがRenderに設定したDB用パスワードと一致している必要があります。
 
+公開アプリの日本語案内には、秘密値を伏せた `接続診断` が表示されます。`使用設定` が `環境変数 ZEN_KEIRIN_DATABASE_URL` ならRenderのURL設定を、`自動生成URL` なら `ZEN_KEIRIN_DATABASE_PASSWORD` または `ZEN_KEIRIN_APP_PASSWORD` とSupabase側ロールのパスワード一致を確認します。`user`、`host`、`port`、`database` が想定と違う場合は、Renderの環境変数を直してから再デプロイします。
+
 ローカルで環境変数を使う例:
 
 ```bash

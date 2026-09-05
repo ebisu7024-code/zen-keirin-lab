@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -183,6 +183,27 @@ def default_supabase_database_url() -> str:
     user = f"{SUPABASE_APP_ROLE}.{SUPABASE_PROJECT_REF}"
     encoded_password = quote(password, safe="")
     return f"postgresql://{user}:{encoded_password}@{SUPABASE_POOLER_HOST}:5432/postgres?sslmode=require"
+
+
+def configured_database_url_with_source() -> tuple[str, str]:
+    candidates = (
+        ("環境変数 ZEN_KEIRIN_DATABASE_URL", os.environ.get("ZEN_KEIRIN_DATABASE_URL", "").strip()),
+        ("環境変数 DATABASE_URL", os.environ.get("DATABASE_URL", "").strip()),
+        ("Streamlit secret ZEN_KEIRIN_DATABASE_URL", streamlit_secret_text("ZEN_KEIRIN_DATABASE_URL")),
+        ("Streamlit secret DATABASE_URL", streamlit_secret_text("DATABASE_URL")),
+        ("Streamlit secret database.url", streamlit_secret_text("database", "url")),
+    )
+    for source, database_url in candidates:
+        if database_url:
+            return database_url, source
+
+    database_url = default_supabase_database_url()
+    if database_url:
+        return (
+            database_url,
+            "自動生成URL（ZEN_KEIRIN_DATABASE_PASSWORD / ZEN_KEIRIN_APP_PASSWORD）",
+        )
+    return "", "未設定（SQLite）"
 
 
 def require_app_password() -> None:
@@ -371,14 +392,7 @@ class PostgresConnection:
 
 
 def configured_database_url() -> str:
-    return (
-        os.environ.get("ZEN_KEIRIN_DATABASE_URL", "").strip()
-        or os.environ.get("DATABASE_URL", "").strip()
-        or streamlit_secret_text("ZEN_KEIRIN_DATABASE_URL")
-        or streamlit_secret_text("DATABASE_URL")
-        or streamlit_secret_text("database", "url")
-        or default_supabase_database_url()
-    )
+    return configured_database_url_with_source()[0]
 
 
 def database_backend() -> str:
@@ -399,12 +413,59 @@ def is_database_connection_error(exc: Exception) -> bool:
     return "connection failed" in message and "pooler.supabase.com" in message
 
 
-def render_database_connection_error() -> None:
+def redact_database_error_message(message: str) -> str:
+    redacted = re.sub(r"(?i)\b(postgres(?:ql)?://[^:\s/@]+:)[^@\s]+@", r"\1***@", message)
+    redacted = re.sub(r"(?i)(\bpassword\s*=\s*)\S+", r"\1***", redacted)
+    redacted = re.sub(r"(?i)(\bpassfile\s*=\s*)\S+", r"\1***", redacted)
+    return redacted
+
+
+def safe_database_error_summary(exc: Exception | None) -> str:
+    if exc is None:
+        return "未取得"
+    message = " ".join(str(exc).split())
+    message = redact_database_error_message(message)
+    if len(message) > 420:
+        message = f"{message[:417]}..."
+    return f"{exc.__class__.__name__}: {message}"
+
+
+def database_connection_diagnostics(exc: Exception | None = None) -> dict[str, str]:
+    database_url, source = configured_database_url_with_source()
+    diagnostics = {
+        "使用設定": source,
+        "DB種類": "PostgreSQL / Supabase" if database_url.lower().startswith(("postgres://", "postgresql://")) else "SQLite",
+    }
+    if database_url:
+        parsed = urlsplit(database_url)
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        diagnostics.update(
+            {
+                "user": unquote(parsed.username or "未取得"),
+                "host": parsed.hostname or "未取得",
+                "port": str(port or "未取得"),
+                "database": (parsed.path or "").lstrip("/") or "未取得",
+            }
+        )
+    diagnostics["error"] = safe_database_error_summary(exc)
+    return diagnostics
+
+
+def format_diagnostics_text(diagnostics: Mapping[str, str]) -> str:
+    return "\n".join(f"{key}: {value}" for key, value in diagnostics.items())
+
+
+def render_database_connection_error(exc: Exception | None = None) -> None:
     st.error("クラウドDBに接続できません。SupabaseまたはRenderのDB設定を確認してください。")
     st.info(
         "Supabaseプロジェクトが停止中、またはRenderのDB接続情報が古い可能性があります。"
         "プロジェクトを再有効化してから、Renderを再デプロイしてください。"
     )
+    st.markdown("#### 接続診断（秘密値は非表示）")
+    st.code(format_diagnostics_text(database_connection_diagnostics(exc)), language="text")
     st.markdown(
         """
         確認するもの:
@@ -5877,7 +5938,7 @@ def load_startup_state():
         races = fetch_races()
     except Exception as exc:
         if is_database_connection_error(exc):
-            render_database_connection_error()
+            render_database_connection_error(exc)
         raise
     return today_sync_result, tipstar_sync_result, races
 
